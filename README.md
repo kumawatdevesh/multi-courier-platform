@@ -126,6 +126,11 @@ Integration tests need a database: `TEST_DATABASE_URL=postgres://…/multi_couri
 tests. The `mock` adapter is steered by `metadata.mock` (`reject` · `timeout` · `duplicate` ·
 `auth-fail`) and advances one lifecycle step per tracking poll.
 
+## API examples
+
+`postman/` has a Postman collection (20 requests with assertions — runnable with newman as a
+smoke test) and curl examples for every endpoint. See [postman/README.md](./postman/README.md).
+
 ## Adding a new courier
 
 Three steps, no existing file changes:

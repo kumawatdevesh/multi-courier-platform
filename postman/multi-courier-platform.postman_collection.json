@@ -1,0 +1,919 @@
+{
+  "info": {
+    "_postman_id": "adb0de8c-4e22-4c46-be34-8c48ae742a7a",
+    "name": "Multi-Courier Integration Platform",
+    "description": "Courier-agnostic shipment API. Run top to bottom: the create requests store `orderId` / `batchId` for the later ones.\n\nSet `baseUrl` (default http://localhost:3000). Requests use the `mock` courier so they work with no credentials; switch `courier_partner` to `urbanebolt` once `COURIER_URBANEBOLT_*` is configured.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3000"
+    },
+    {
+      "key": "orderId",
+      "value": ""
+    },
+    {
+      "key": "batchId",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "System",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": "Liveness + DB + registered couriers."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "List couriers",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/couriers",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "couriers"
+              ]
+            },
+            "description": "Reads the registry; correct for free on every new partner."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Orders",
+      "item": [
+        {
+          "name": "Create order (mock)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "Happy path. Stores `orderId` for the requests below.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"mock\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const d = pm.response.json().data;",
+                  "pm.collectionVariables.set('orderId', d.id);",
+                  "pm.test('has awb', () => pm.expect(d.awb).to.be.a('string'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Create order (urbanebolt)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "Same body, real courier. Needs COURIER_URBANEBOLT_* env. Returns a real UAT AWB.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"urbanebolt\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 or courier error', () => pm.expect([201, 422, 503, 504]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get order",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{orderId}}"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Track order",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/track",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{orderId}}",
+                "track"
+              ]
+            },
+            "description": "Refreshes from the courier and appends to tracking_history. Re-run it: the mock advances one step per poll, and the history dedupes."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));",
+                  "pm.test('has events', () => pm.expect(pm.response.json().data.events).to.be.an('array').that.is.not.empty);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Cancel order",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/{{orderId}}/cancel",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "{{orderId}}",
+                "cancel"
+              ]
+            },
+            "description": "Idempotent. After tracking has moved it to PICKED_UP the mock refuses (422), like a real courier."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200 or 422', () => pm.expect([200, 422]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Errors",
+      "item": [
+        {
+          "name": "400 \u00b7 validation (field-level, all at once)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"mock\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": null,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"123\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"12\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('code VALIDATION_ERROR', () => pm.expect(pm.response.json().error.code).to.eql('VALIDATION_ERROR'));",
+                  "pm.test('3 field errors', () => pm.expect(pm.response.json().error.details).to.have.length(3));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 \u00b7 unknown courier (lists supported)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"delhivery\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('code UNKNOWN_COURIER', () => pm.expect(pm.response.json().error.code).to.eql('UNKNOWN_COURIER'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "409 \u00b7 duplicate order_id",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "Run twice. Second run is 409 and the courier is never called.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"PM-DUPLICATE\",\n  \"courier_partner\": \"mock\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 first time, 409 after', () => pm.expect([201, 409]).to.include(pm.response.code));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "422 \u00b7 courier rejected (mock directive)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "`metadata.mock` steers the mock: reject \u00b7 timeout \u00b7 duplicate \u00b7 auth-fail. Row is persisted FAILED with last_error; vendor text never reaches this response.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"mock\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  },\n  \"metadata\": {\n    \"mock\": \"reject\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('code COURIER_REJECTED', () => pm.expect(pm.response.json().error.code).to.eql('COURIER_REJECTED'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "504 \u00b7 courier timeout (mock directive)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"order_id\": \"{{orderRef}}\",\n  \"courier_partner\": \"mock\",\n  \"payment_mode\": \"COD\",\n  \"cod_amount\": 499,\n  \"service_type\": \"SAME_DAY\",\n  \"pickup\": {\n    \"name\": \"Warehouse\",\n    \"phone\": \"9876543210\",\n    \"email\": \"ops@example.com\",\n    \"line1\": \"1 Industrial Rd\",\n    \"line2\": \"Sector 5\",\n    \"city\": \"Gurgaon\",\n    \"state\": \"Haryana\",\n    \"pincode\": \"122001\",\n    \"country\": \"INDIA\",\n    \"type\": \"SELLER\"\n  },\n  \"drop\": {\n    \"name\": \"Asha Rao\",\n    \"phone\": \"9876543211\",\n    \"email\": \"asha@example.com\",\n    \"line1\": \"12 MG Road\",\n    \"city\": \"Bengaluru\",\n    \"state\": \"Karnataka\",\n    \"pincode\": \"560001\",\n    \"country\": \"INDIA\",\n    \"type\": \"HOME\"\n  },\n  \"parcel\": {\n    \"description\": \"Books\",\n    \"weight_kg\": 1.2,\n    \"length_cm\": 30,\n    \"breadth_cm\": 20,\n    \"height_cm\": 10,\n    \"pieces\": 1,\n    \"declared_value\": 499\n  },\n  \"invoice\": {\n    \"number\": \"INV-2026-001\",\n    \"date\": \"2026-09-17\",\n    \"value\": 499\n  },\n  \"metadata\": {\n    \"mock\": \"timeout\"\n  }\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('orderRef', 'PM-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('504', () => pm.response.to.have.status(504));",
+                  "pm.test('code COURIER_TIMEOUT', () => pm.expect(pm.response.json().error.code).to.eql('COURIER_TIMEOUT'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 \u00b7 malformed id",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/not-a-uuid",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "not-a-uuid"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('code VALIDATION_ERROR', () => pm.expect(pm.response.json().error.code).to.eql('VALIDATION_ERROR'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 \u00b7 unknown order",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/00000000-0000-4000-8000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "00000000-0000-4000-8000-000000000000"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('code ORDER_NOT_FOUND', () => pm.expect(pm.response.json().error.code).to.eql('ORDER_NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 \u00b7 unknown route (same envelope)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/nope",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "nope"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('code NOT_FOUND', () => pm.expect(pm.response.json().error.code).to.eql('NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 \u00b7 malformed JSON",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders"
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\"order_id\": broken"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('code VALIDATION_ERROR', () => pm.expect(pm.response.json().error.code).to.eql('VALIDATION_ERROR'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Bulk",
+      "item": [
+        {
+          "name": "Submit bulk (202 + batchId)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/bulk",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "bulk"
+              ]
+            },
+            "description": "4 orders: 2 ok, 1 rejected by the courier, 1 in-payload duplicate. Returns immediately; the worker dispatches in the background.",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"orders\": [\n    {\n      \"order_id\": \"{{bulkRef}}-1\",\n      \"courier_partner\": \"mock\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      }\n    },\n    {\n      \"order_id\": \"{{bulkRef}}-2\",\n      \"courier_partner\": \"mock\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      }\n    },\n    {\n      \"order_id\": \"{{bulkRef}}-3\",\n      \"courier_partner\": \"mock\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      },\n      \"metadata\": {\n        \"mock\": \"reject\"\n      }\n    },\n    {\n      \"order_id\": \"{{bulkRef}}-1\",\n      \"courier_partner\": \"mock\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      }\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.variables.set('bulkRef', 'PMB-' + Date.now());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202', () => pm.response.to.have.status(202));",
+                  "const d = pm.response.json().data;",
+                  "pm.collectionVariables.set('batchId', d.batchId);",
+                  "pm.test('accepted 3, 1 duplicate', () => { pm.expect(d.accepted).to.eql(3); pm.expect(d.duplicates).to.have.length(1); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Get batch (poll until COMPLETED)",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/batches/{{batchId}}",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "batches",
+                "{{batchId}}"
+              ]
+            },
+            "description": "Per-order status / awb / error plus counts. Re-run after ~1s: status becomes COMPLETED with succeeded 2, failed 1."
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('200', () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "400 \u00b7 bulk validation names the index",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/orders/bulk",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "orders",
+                "bulk"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"orders\": [\n    {\n      \"order_id\": \"X-1\",\n      \"courier_partner\": \"mock\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      }\n    },\n    {\n      \"order_id\": \"X-2\",\n      \"courier_partner\": \"delhivery\",\n      \"payment_mode\": \"COD\",\n      \"cod_amount\": 499,\n      \"service_type\": \"SAME_DAY\",\n      \"pickup\": {\n        \"name\": \"Warehouse\",\n        \"phone\": \"9876543210\",\n        \"email\": \"ops@example.com\",\n        \"line1\": \"1 Industrial Rd\",\n        \"line2\": \"Sector 5\",\n        \"city\": \"Gurgaon\",\n        \"state\": \"Haryana\",\n        \"pincode\": \"122001\",\n        \"country\": \"INDIA\",\n        \"type\": \"SELLER\"\n      },\n      \"drop\": {\n        \"name\": \"Asha Rao\",\n        \"phone\": \"9876543211\",\n        \"email\": \"asha@example.com\",\n        \"line1\": \"12 MG Road\",\n        \"city\": \"Bengaluru\",\n        \"state\": \"Karnataka\",\n        \"pincode\": \"560001\",\n        \"country\": \"INDIA\",\n        \"type\": \"HOME\"\n      },\n      \"parcel\": {\n        \"description\": \"Books\",\n        \"weight_kg\": 1.2,\n        \"length_cm\": 30,\n        \"breadth_cm\": 20,\n        \"height_cm\": 10,\n        \"pieces\": 1,\n        \"declared_value\": 499\n      },\n      \"invoice\": {\n        \"number\": \"INV-2026-001\",\n        \"date\": \"2026-09-17\",\n        \"value\": 499\n      }\n    }\n  ]\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('400', () => pm.response.to.have.status(400));",
+                  "pm.test('code UNKNOWN_COURIER', () => pm.expect(pm.response.json().error.code).to.eql('UNKNOWN_COURIER'));",
+                  "pm.test('field is orders.1.courier_partner', () => pm.expect(pm.response.json().error.details[0].field).to.eql('orders.1.courier_partner'));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "404 \u00b7 unknown batch",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/batches/00000000-0000-4000-8000-000000000000",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "api",
+                "v1",
+                "batches",
+                "00000000-0000-4000-8000-000000000000"
+              ]
+            },
+            "description": ""
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('404', () => pm.response.to.have.status(404));",
+                  "pm.test('code NOT_FOUND', () => pm.expect(pm.response.json().error.code).to.eql('NOT_FOUND'));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
