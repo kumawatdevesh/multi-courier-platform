@@ -1,0 +1,220 @@
+import 'reflect-metadata';
+import type { Express } from 'express';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+
+import { buildApp } from '../../src/app';
+import { AppDataSource } from '../../src/db/data-source';
+import type { DispatchWorker } from '../../src/jobs/dispatch.worker';
+import { createOrderBody } from '../helpers/courier';
+
+/** The worker is driven by hand (runOnce) so each test controls exactly when dispatch happens. */
+
+let app: Express;
+let worker: DispatchWorker;
+
+beforeAll(async () => {
+  ({ app, worker } = await buildApp());
+  await AppDataSource.runMigrations();
+});
+beforeEach(async () => {
+  await AppDataSource.query('TRUNCATE TABLE orders, batches CASCADE');
+});
+afterAll(async () => {
+  await AppDataSource.destroy();
+});
+
+const submit = (orders: unknown[]) => request(app).post('/api/v1/orders/bulk').send({ orders });
+const getBatch = (id: string) => request(app).get(`/api/v1/batches/${id}`);
+const drain = async () => {
+  while ((await worker.runOnce()) > 0) {
+    /* keep claiming until nothing is PENDING */
+  }
+};
+const statusCounts = (batchId: string) =>
+  AppDataSource.query(
+    'SELECT status, count(*)::int AS n FROM orders WHERE batch_id=$1 GROUP BY status ORDER BY status',
+    [batchId],
+  );
+
+describe('POST /api/v1/orders/bulk', () => {
+  it('202 with batch_id immediately; nothing dispatched until the worker runs', async () => {
+    const res = await submit([createOrderBody(), createOrderBody(), createOrderBody()]).expect(202);
+    expect(res.body.data).toMatchObject({ total: 3, accepted: 3, duplicates: [] });
+    expect(res.body.data.batchId).toMatch(/^[0-9a-f-]{36}$/);
+
+    expect(await statusCounts(res.body.data.batchId)).toEqual([{ status: 'PENDING', n: 3 }]);
+    const before = await getBatch(res.body.data.batchId).expect(200);
+    expect(before.body.data).toMatchObject({
+      status: 'QUEUED',
+      pending: 3,
+      succeeded: 0,
+      failed: 0,
+    });
+  });
+
+  it('rejects the whole request on a validation error, writing nothing', async () => {
+    const bad = createOrderBody();
+    (bad.drop as Record<string, unknown>).pincode = '12';
+    const res = await submit([createOrderBody(), bad]).expect(400);
+    expect(res.body.error.details).toEqual([
+      { field: 'orders.1.drop.pincode', message: 'must be a 6-digit pincode' },
+    ]);
+    expect(await AppDataSource.query('SELECT count(*)::int AS n FROM batches')).toEqual([{ n: 0 }]);
+  });
+
+  it('rejects the whole request on an unknown courier, naming the index', async () => {
+    const res = await submit([
+      createOrderBody(),
+      createOrderBody({ courier_partner: 'delhivery' }),
+    ]).expect(400);
+    expect(res.body.error.code).toBe('UNKNOWN_COURIER');
+    expect(res.body.error.details[0]).toMatchObject({
+      field: 'orders.1.courier_partner',
+      rejectedValue: 'delhivery',
+    });
+    expect(await AppDataSource.query('SELECT count(*)::int AS n FROM orders')).toEqual([{ n: 0 }]);
+  });
+
+  it('caps at 100 orders', async () => {
+    const res = await submit(Array.from({ length: 101 }, () => createOrderBody())).expect(400);
+    expect(res.body.error.details[0].field).toBe('orders');
+  });
+
+  describe('idempotency on order_id', () => {
+    it('a duplicate inside one payload is inserted once and reported', async () => {
+      const dup = createOrderBody({ order_id: 'BULK-DUP' });
+      const res = await submit([dup, createOrderBody(), dup]).expect(202);
+      expect(res.body.data).toMatchObject({
+        total: 3,
+        accepted: 2,
+        duplicates: [{ orderId: 'BULK-DUP', reason: 'DUPLICATE_ORDER' }],
+      });
+      expect(
+        await AppDataSource.query(
+          "SELECT count(*)::int AS n FROM orders WHERE order_id='BULK-DUP'",
+        ),
+      ).toEqual([{ n: 1 }]);
+    });
+
+    it('resubmitting a whole batch creates zero new shipments', async () => {
+      const orders = [createOrderBody(), createOrderBody(), createOrderBody()];
+      const first = await submit(orders).expect(202);
+      await drain();
+      const awbsBefore = await AppDataSource.query('SELECT awb FROM orders ORDER BY awb');
+
+      const second = await submit(orders).expect(202);
+      expect(second.body.data).toMatchObject({ total: 3, accepted: 0 });
+      expect(second.body.data.duplicates).toHaveLength(3);
+      await drain();
+
+      expect(await AppDataSource.query('SELECT awb FROM orders ORDER BY awb')).toEqual(awbsBefore);
+      expect(first.body.data.batchId).not.toBe(second.body.data.batchId);
+    });
+
+    it('an order_id already used by a single create is a duplicate for bulk too', async () => {
+      const single = createOrderBody({ order_id: 'SINGLE-1' });
+      await request(app).post('/api/v1/orders').send(single).expect(201);
+      const res = await submit([single]).expect(202);
+      expect(res.body.data).toMatchObject({ accepted: 0, duplicates: [{ orderId: 'SINGLE-1' }] });
+    });
+  });
+});
+
+describe('worker', () => {
+  it('drains a batch: per-order outcomes, partial success, batch COMPLETED', async () => {
+    const res = await submit([
+      createOrderBody({ order_id: 'W-ok-1' }),
+      createOrderBody({ order_id: 'W-ok-2' }),
+      createOrderBody({ order_id: 'W-rej', metadata: { mock: 'reject' } }),
+      createOrderBody({ order_id: 'W-timeout', metadata: { mock: 'timeout' } }),
+    ]).expect(202);
+    const batchId = res.body.data.batchId;
+
+    await drain();
+
+    const view = (await getBatch(batchId).expect(200)).body.data;
+    expect(view).toMatchObject({
+      status: 'COMPLETED',
+      total: 4,
+      accepted: 4,
+      succeeded: 2,
+      failed: 2,
+      pending: 0,
+    });
+    expect(view.completedAt).toBeTruthy();
+
+    const byId = Object.fromEntries(view.orders.map((o: { orderId: string }) => [o.orderId, o]));
+    expect(byId['W-ok-1']).toMatchObject({
+      status: 'CREATED',
+      awb: expect.stringMatching(/^MOCK/),
+      error: null,
+    });
+    expect(byId['W-rej']).toMatchObject({
+      status: 'FAILED',
+      awb: null,
+      error: { code: 'COURIER_REJECTED' },
+    });
+    expect(byId['W-timeout']).toMatchObject({
+      status: 'FAILED',
+      error: { code: 'COURIER_TIMEOUT' },
+    });
+    // the vendor's wording is not in the batch view either
+    expect(JSON.stringify(view)).not.toContain('MOCK: rejected');
+  });
+
+  it('claims in chunks of batchSize and reports how many it took', async () => {
+    await submit(Array.from({ length: 25 }, () => createOrderBody())).expect(202);
+    expect(await worker.runOnce()).toBe(20);
+    expect(await worker.runOnce()).toBe(5);
+    expect(await worker.runOnce()).toBe(0);
+  });
+
+  it('two concurrent ticks never claim the same row (FOR UPDATE SKIP LOCKED)', async () => {
+    const res = await submit(Array.from({ length: 30 }, () => createOrderBody())).expect(202);
+    const [a, b] = await Promise.all([worker.runOnce(), worker.runOnce()]);
+    expect(a + b).toBe(30);
+    const counts = await statusCounts(res.body.data.batchId);
+    expect(counts).toEqual([{ status: 'CREATED', n: 30 }]);
+  });
+
+  it('a row stuck in PROCESSING is never re-claimed — it belongs to reconciliation', async () => {
+    const res = await submit([createOrderBody({ order_id: 'STUCK' })]).expect(202);
+    await AppDataSource.query("UPDATE orders SET status='PROCESSING' WHERE order_id='STUCK'"); // simulate a crash mid-dispatch
+    expect(await worker.runOnce()).toBe(0);
+    expect(await statusCounts(res.body.data.batchId)).toEqual([{ status: 'PROCESSING', n: 1 }]);
+    expect((await getBatch(res.body.data.batchId)).body.data).toMatchObject({
+      status: 'QUEUED',
+      pending: 1,
+    });
+  });
+
+  it('a partner disabled after submit fails that order with COURIER_UNAVAILABLE, not the batch', async () => {
+    const res = await submit([
+      createOrderBody({ order_id: 'GONE' }),
+      createOrderBody({ order_id: 'FINE' }),
+    ]).expect(202);
+    await AppDataSource.query(
+      "UPDATE orders SET courier_partner='delhivery' WHERE order_id='GONE'",
+    );
+    await drain();
+    const byId = Object.fromEntries(
+      (await getBatch(res.body.data.batchId)).body.data.orders.map((o: { orderId: string }) => [
+        o.orderId,
+        o,
+      ]),
+    );
+    expect(byId['GONE']).toMatchObject({
+      status: 'FAILED',
+      error: { code: 'COURIER_UNAVAILABLE' },
+    });
+    expect(byId['FINE']).toMatchObject({ status: 'CREATED' });
+  });
+});
+
+describe('GET /api/v1/batches/:batchId', () => {
+  it('404 for an unknown batch, 400 for a malformed id', async () => {
+    await getBatch('00000000-0000-4000-8000-000000000000').expect(404);
+    await getBatch('nope').expect(400);
+  });
+});

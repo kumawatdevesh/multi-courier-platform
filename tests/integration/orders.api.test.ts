@@ -1,0 +1,318 @@
+import 'reflect-metadata';
+import type { Express } from 'express';
+import request from 'supertest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+
+import { buildApp } from '../../src/app';
+import { AppDataSource } from '../../src/db/data-source';
+import { createOrderBody as validOrder } from '../helpers/courier';
+
+/** Full stack against real Postgres; only the courier is fake. */
+
+let app: Express;
+
+beforeAll(async () => {
+  ({ app } = await buildApp());
+  await AppDataSource.runMigrations();
+});
+
+beforeEach(async () => {
+  await AppDataSource.query('TRUNCATE TABLE orders CASCADE');
+});
+
+afterAll(async () => {
+  await AppDataSource.destroy();
+});
+
+const row = (id: string) =>
+  AppDataSource.query('SELECT * FROM orders WHERE id = $1', [id]).then((r) => r[0]);
+const history = (id: string) =>
+  AppDataSource.query(
+    'SELECT * FROM tracking_history WHERE order_id = $1 ORDER BY status_timestamp',
+    [id],
+  );
+
+describe('GET /health and /api/v1/couriers', () => {
+  it('reports the registered couriers', async () => {
+    const health = await request(app).get('/health').expect(200);
+    expect(health.body).toMatchObject({ status: 'ok', database: 'up', couriers: ['mock'] });
+
+    const couriers = await request(app).get('/api/v1/couriers').expect(200);
+    expect(couriers.body.data.couriers).toEqual([{ key: 'mock', displayName: 'Mock Courier' }]);
+  });
+});
+
+describe('POST /api/v1/orders', () => {
+  it('creates a shipment and persists the full audit record', async () => {
+    const body = validOrder();
+    const res = await request(app).post('/api/v1/orders').send(body).expect(201);
+
+    expect(res.body.success).toBe(true);
+    expect(res.body.data).toMatchObject({
+      orderId: body.order_id,
+      courierPartner: 'mock',
+      courierOrderId: expect.stringMatching(/^MOCK-ORD-/),
+      awb: expect.stringMatching(/^MOCK\d{10}$/),
+      status: 'CREATED',
+      labelUrl: expect.stringContaining('/labels/'),
+    });
+    expect(res.headers['x-request-id']).toBeTruthy();
+
+    const persisted = await row(res.body.data.id);
+    expect(persisted).toMatchObject({
+      status: 'CREATED',
+      courier_partner: 'mock',
+      attempt_count: 1,
+      last_error: null,
+    });
+    expect(persisted.normalized_payload.orderId).toBe(body.order_id);
+    expect(persisted.request_payload).toMatchObject({ orderNumber: body.order_id });
+    expect(persisted.response_payload).toMatchObject({ status: 'Success', awb: res.body.data.awb });
+  });
+
+  it('never exposes audit columns in the response', async () => {
+    const res = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    for (const key of ['normalizedPayload', 'requestPayload', 'responsePayload', 'lastError']) {
+      expect(res.body.data).not.toHaveProperty(key);
+    }
+  });
+
+  it('400 with field-level errors for invalid input, all at once', async () => {
+    const res = await request(app)
+      .post('/api/v1/orders')
+      .send(
+        validOrder({
+          cod_amount: undefined,
+          pickup: { name: 'x', phone: '1', line1: 'l', city: 'c', state: 's', pincode: '1' },
+        }),
+      )
+      .expect(400);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    expect(res.body.error.details.map((d: { field: string }) => d.field).sort()).toEqual([
+      'cod_amount',
+      'pickup.phone',
+      'pickup.pincode',
+    ]);
+  });
+
+  it('400 UNKNOWN_COURIER lists the supported couriers and writes no row', async () => {
+    const res = await request(app)
+      .post('/api/v1/orders')
+      .send(validOrder({ courier_partner: 'delhivery' }))
+      .expect(400);
+    expect(res.body.error).toMatchObject({
+      code: 'UNKNOWN_COURIER',
+      details: [
+        {
+          field: 'courier_partner',
+          message: 'Supported couriers: mock',
+          rejectedValue: 'delhivery',
+        },
+      ],
+    });
+    expect(await AppDataSource.query('SELECT count(*)::int AS n FROM orders')).toEqual([{ n: 0 }]);
+  });
+
+  it('400 for malformed JSON, with a request id', async () => {
+    const res = await request(app)
+      .post('/api/v1/orders')
+      .set('Content-Type', 'application/json')
+      .send('{"broken')
+      .expect(400);
+    expect(res.body.error).toMatchObject({
+      code: 'VALIDATION_ERROR',
+      message: 'Request body is not valid JSON',
+    });
+    expect(res.body.error.requestId).toBeTruthy();
+  });
+
+  describe('idempotency on order_id', () => {
+    it('409 DUPLICATE_ORDER on resubmission, with no second row and no second courier call', async () => {
+      const body = validOrder();
+      const first = await request(app).post('/api/v1/orders').send(body).expect(201);
+      const second = await request(app).post('/api/v1/orders').send(body).expect(409);
+
+      expect(second.body.error).toMatchObject({
+        code: 'DUPLICATE_ORDER',
+        details: [{ field: 'order_id', rejectedValue: body.order_id }],
+      });
+      const rows = await AppDataSource.query('SELECT awb FROM orders WHERE order_id = $1', [
+        body.order_id,
+      ]);
+      expect(rows).toEqual([{ awb: first.body.data.awb }]);
+    });
+
+    it('holds under concurrency: 5 simultaneous submissions → exactly one shipment', async () => {
+      const body = validOrder();
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => request(app).post('/api/v1/orders').send(body)),
+      );
+      const statuses = results.map((r) => r.status).sort();
+      expect(statuses).toEqual([201, 409, 409, 409, 409]);
+      expect(
+        await AppDataSource.query('SELECT count(*)::int AS n FROM orders WHERE order_id = $1', [
+          body.order_id,
+        ]),
+      ).toEqual([{ n: 1 }]);
+    });
+  });
+
+  describe('courier failure is persisted for reconciliation', () => {
+    it('rejection → 422, row FAILED with last_error and both audit payloads', async () => {
+      const body = validOrder({ metadata: { mock: 'reject' } });
+      const res = await request(app).post('/api/v1/orders').send(body).expect(422);
+      expect(res.body.error.code).toBe('COURIER_REJECTED');
+      expect(JSON.stringify(res.body)).not.toContain('MOCK: rejected by directive');
+
+      const [persisted] = await AppDataSource.query('SELECT * FROM orders WHERE order_id = $1', [
+        body.order_id,
+      ]);
+      expect(persisted).toMatchObject({ status: 'FAILED', awb: null, attempt_count: 1 });
+      expect(persisted.last_error).toMatchObject({
+        code: 'COURIER_REJECTED',
+        courierPartner: 'mock',
+      });
+      expect(persisted.last_error.rawResponse.message).toBe('MOCK: rejected by directive');
+      expect(persisted.request_payload).not.toBeNull();
+      expect(persisted.response_payload).not.toBeNull();
+    });
+
+    it('timeout → 504 COURIER_TIMEOUT, row FAILED', async () => {
+      const body = validOrder({ metadata: { mock: 'timeout' } });
+      const res = await request(app).post('/api/v1/orders').send(body).expect(504);
+      expect(res.body.error.code).toBe('COURIER_TIMEOUT');
+      const [persisted] = await AppDataSource.query(
+        'SELECT status FROM orders WHERE order_id = $1',
+        [body.order_id],
+      );
+      expect(persisted.status).toBe('FAILED');
+    });
+
+    it('a FAILED order_id is still occupied — resubmitting is a 409, not a retry', async () => {
+      const body = validOrder({ metadata: { mock: 'reject' } });
+      await request(app).post('/api/v1/orders').send(body).expect(422);
+      await request(app)
+        .post('/api/v1/orders')
+        .send({ ...body, metadata: {} })
+        .expect(409);
+    });
+  });
+});
+
+describe('GET /api/v1/orders/:orderId', () => {
+  it('returns the order', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    const res = await request(app).get(`/api/v1/orders/${created.body.data.id}`).expect(200);
+    expect(res.body.data).toEqual(created.body.data);
+  });
+  it('404 for a well-formed id that does not exist', async () => {
+    const res = await request(app)
+      .get('/api/v1/orders/00000000-0000-4000-8000-000000000000')
+      .expect(404);
+    expect(res.body.error.code).toBe('ORDER_NOT_FOUND');
+  });
+  it('400 for a malformed id — never reaches the database', async () => {
+    const res = await request(app).get('/api/v1/orders/not-a-uuid').expect(400);
+    expect(res.body.error.details).toEqual([{ field: 'orderId', message: 'must be a UUID' }]);
+  });
+});
+
+describe('GET /api/v1/orders/:orderId/track', () => {
+  it('appends new events, dedupes repeats, and updates the order status', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    const id = created.body.data.id;
+
+    const t1 = await request(app).get(`/api/v1/orders/${id}/track`).expect(200);
+    expect(t1.body.data.status).toBe('PICKED_UP');
+    expect(t1.body.data.events.map((e: { status: string }) => e.status)).toEqual([
+      'CREATED',
+      'PICKED_UP',
+    ]);
+
+    const t2 = await request(app).get(`/api/v1/orders/${id}/track`).expect(200);
+    expect(t2.body.data.status).toBe('IN_TRANSIT');
+    expect(t2.body.data.events).toHaveLength(3);
+
+    // 2 + 3 reported, 3 distinct.
+    expect(await history(id)).toHaveLength(3);
+    expect((await row(id)).status).toBe('IN_TRANSIT');
+  });
+
+  it('tracking_history rows carry both the courier time and our ingest time', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    await request(app).get(`/api/v1/orders/${created.body.data.id}/track`).expect(200);
+    const [event] = await history(created.body.data.id);
+    expect(event.status_timestamp).toBeInstanceOf(Date);
+    expect(event.created_at).toBeInstanceOf(Date);
+    expect(event.courier_status_code).toBe('MOCK_CREATED');
+    expect(event.raw_payload).toMatchObject({ step: 0 });
+  });
+
+  it('409 INVALID_ORDER_STATE for a FAILED order that has no AWB', async () => {
+    const body = validOrder({ metadata: { mock: 'reject' } });
+    await request(app).post('/api/v1/orders').send(body).expect(422);
+    const [failed] = await AppDataSource.query('SELECT id FROM orders WHERE order_id = $1', [
+      body.order_id,
+    ]);
+    const res = await request(app).get(`/api/v1/orders/${failed.id}/track`).expect(409);
+    expect(res.body.error.code).toBe('INVALID_ORDER_STATE');
+  });
+
+  it('503 COURIER_UNAVAILABLE when the stored partner is no longer configured', async () => {
+    const [{ id }] = await AppDataSource.query(
+      `INSERT INTO orders (order_id, courier_partner, status, awb, normalized_payload)
+       VALUES ('LEGACY-1', 'delhivery', 'CREATED', 'DLV1', '{"orderId":"LEGACY-1"}') RETURNING id`,
+    );
+    const res = await request(app).get(`/api/v1/orders/${id}/track`).expect(503);
+    expect(res.body.error).toMatchObject({
+      code: 'COURIER_UNAVAILABLE',
+      message: expect.stringContaining('delhivery'),
+    });
+  });
+});
+
+describe('POST /api/v1/orders/:orderId/cancel', () => {
+  it('cancels a fresh shipment and persists CANCELLED', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    const res = await request(app)
+      .post(`/api/v1/orders/${created.body.data.id}/cancel`)
+      .expect(200);
+    expect(res.body.data).toEqual({ cancelled: true, message: 'Cancelled' });
+    expect((await row(created.body.data.id)).status).toBe('CANCELLED');
+  });
+
+  it('is idempotent: cancelling twice does not call the courier again', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    await request(app).post(`/api/v1/orders/${created.body.data.id}/cancel`).expect(200);
+    const again = await request(app)
+      .post(`/api/v1/orders/${created.body.data.id}/cancel`)
+      .expect(200);
+    expect(again.body.data.message).toBe('Order is already cancelled');
+  });
+
+  it('422 when the courier refuses (already picked up), status unchanged', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    await request(app).get(`/api/v1/orders/${created.body.data.id}/track`).expect(200); // → PICKED_UP
+    const res = await request(app)
+      .post(`/api/v1/orders/${created.body.data.id}/cancel`)
+      .expect(422);
+    expect(res.body.error.code).toBe('COURIER_REJECTED');
+    expect((await row(created.body.data.id)).status).toBe('PICKED_UP');
+  });
+
+  it('409 for a DELIVERED order without calling the courier', async () => {
+    const [{ id }] = await AppDataSource.query(
+      `INSERT INTO orders (order_id, courier_partner, status, awb, normalized_payload)
+       VALUES ('DONE-1', 'mock', 'DELIVERED', 'MOCK0000000099', '{"orderId":"DONE-1"}') RETURNING id`,
+    );
+    const res = await request(app).post(`/api/v1/orders/${id}/cancel`).expect(409);
+    expect(res.body.error.code).toBe('INVALID_ORDER_STATE');
+  });
+});
+
+describe('unknown routes', () => {
+  it('return the same envelope', async () => {
+    const res = await request(app).get('/api/v1/nope').expect(404);
+    expect(res.body).toMatchObject({ success: false, error: { code: 'NOT_FOUND' } });
+  });
+});
