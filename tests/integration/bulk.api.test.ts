@@ -112,6 +112,26 @@ describe('POST /api/v1/orders/bulk', () => {
       expect(first.body.data.batchId).not.toBe(second.body.data.batchId);
     });
 
+    it('a FAILED order in a resubmitted batch is retried under the new batch', async () => {
+      const bad = createOrderBody({ order_id: 'RETRY-1', metadata: { mock: 'reject' } });
+      const first = await submit([bad]).expect(202);
+      await drain();
+      expect((await getBatch(first.body.data.batchId)).body.data).toMatchObject({ failed: 1 });
+
+      const second = await submit([{ ...bad, metadata: {} }]).expect(202);
+      expect(second.body.data).toMatchObject({ accepted: 1, duplicates: [] });
+      await drain();
+
+      const rows = await AppDataSource.query(
+        "SELECT status, batch_id FROM orders WHERE order_id='RETRY-1'",
+      );
+      expect(rows).toEqual([{ status: 'CREATED', batch_id: second.body.data.batchId }]);
+      expect((await getBatch(second.body.data.batchId)).body.data).toMatchObject({
+        status: 'COMPLETED',
+        succeeded: 1,
+      });
+    });
+
     it('an order_id already used by a single create is a duplicate for bulk too', async () => {
       const single = createOrderBody({ order_id: 'SINGLE-1' });
       await request(app).post('/api/v1/orders').send(single).expect(201);
@@ -207,6 +227,29 @@ describe('worker', () => {
       status: 'QUEUED',
       pending: 1,
     });
+  });
+
+  it('a row PROCESSING past the stuck threshold is marked FAILED, the batch completes, and it can be resubmitted', async () => {
+    const res = await submit([
+      createOrderBody({ order_id: 'STALE' }),
+      createOrderBody({ order_id: 'OK' }),
+    ]).expect(202);
+    // crash mid-dispatch, long enough ago to exceed the threshold
+    await AppDataSource.query(
+      "UPDATE orders SET status='PROCESSING', updated_at = now() - interval '1 hour' WHERE order_id='STALE'",
+    );
+    await drain();
+
+    const view = (await getBatch(res.body.data.batchId)).body.data;
+    expect(view).toMatchObject({ status: 'COMPLETED', succeeded: 1, failed: 1, pending: 0 });
+    const stale = view.orders.find((o: { orderId: string }) => o.orderId === 'STALE');
+    expect(stale).toMatchObject({ status: 'FAILED', error: { code: 'DISPATCH_INTERRUPTED' } });
+
+    // an operator has confirmed with the courier — resubmit retries it
+    await request(app)
+      .post('/api/v1/orders')
+      .send(createOrderBody({ order_id: 'STALE' }))
+      .expect(201);
   });
 
   it('a partner disabled after submit fails that order with COURIER_UNAVAILABLE, not the batch', async () => {

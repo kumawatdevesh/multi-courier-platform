@@ -72,6 +72,33 @@ export class BatchService {
         .returning('order_id')
         .execute();
 
+      // A FAILED order resubmitted in a later batch is a retry: re-queue it under this batch
+      // with the new payload. Per row, since each carries its own payload.
+      const returned = raw as Array<{ order_id: string }>;
+      for (const row of rows) {
+        if (returned.some((r) => r.order_id === row.orderId)) continue;
+        const { raw: retried } = await tx
+          .getRepository(Order)
+          .createQueryBuilder()
+          .update()
+          .set({
+            status: 'PENDING',
+            batchId: batch.id,
+            courierPartner: row.courierPartner,
+            normalizedPayload: row.normalizedPayload,
+            lastError: null,
+            awb: null,
+            courierOrderId: null,
+          } as QueryDeepPartialEntity<Order>)
+          .where('order_id = :orderId AND status = :failed', {
+            orderId: row.orderId,
+            failed: 'FAILED',
+          })
+          .returning('order_id')
+          .execute();
+        returned.push(...(retried as Array<{ order_id: string }>));
+      }
+
       // A repeated order_id inside the payload inserts once; only its first occurrence counts.
       const inserted = new Set((raw as Array<{ order_id: string }>).map((r) => r.order_id));
       const seen = new Set<string>();

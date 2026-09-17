@@ -124,6 +124,7 @@ a missing required value fails at boot with the variable named, not at first req
 | `WORKER_POLL_MS` | `1000` | how often the worker looks for `PENDING` orders |
 | `WORKER_BATCH_SIZE` | `20` | rows claimed per tick |
 | `COURIER_CONCURRENCY` | `10` | max in-flight courier calls per partner per tick |
+| `RECONCILE_STUCK_AFTER_MS` | `300000` | a row `PROCESSING` longer than this is marked `FAILED` (`DISPATCH_INTERRUPTED`) |
 | `LOG_LEVEL` | `info` | pino level; `silent` in tests |
 | `COURIER_<KEY>_ENABLED` | `false` | registers the adapter at boot |
 | `COURIER_<KEY>_BASE_URL` | — | |
@@ -139,7 +140,7 @@ UrbaneBolt needs `_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`; the mock needs noth
 ## Testing
 
 ```bash
-npm test              # everything: 72 unit + 37 integration, ~3 s, no network
+npm test              # everything: 72 unit + 41 integration, ~3 s, no network
 npm run test:unit     # retry, token cache, HTTP client (nock), UrbaneBolt mapping, DTOs, errors
 npm run test:int      # real Express + Postgres, mock courier: orders, tracking, cancel, bulk, worker
 npm run check         # typecheck (src + tests) + prettier --check + all tests

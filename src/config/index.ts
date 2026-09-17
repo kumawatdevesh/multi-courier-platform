@@ -11,6 +11,7 @@ const schema = z.object({
   WORKER_POLL_MS: z.coerce.number().int().positive().default(1000),
   WORKER_BATCH_SIZE: z.coerce.number().int().positive().max(500).default(20),
   COURIER_CONCURRENCY: z.coerce.number().int().positive().default(10),
+  RECONCILE_STUCK_AFTER_MS: z.coerce.number().int().positive().default(300_000),
 });
 
 const parsed = schema.safeParse(process.env);
@@ -33,5 +34,6 @@ export const config = {
     pollMs: parsed.data.WORKER_POLL_MS,
     batchSize: parsed.data.WORKER_BATCH_SIZE,
     concurrencyPerPartner: parsed.data.COURIER_CONCURRENCY,
+    stuckAfterMs: parsed.data.RECONCILE_STUCK_AFTER_MS,
   },
 } as const;

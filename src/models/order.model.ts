@@ -14,6 +14,23 @@ import type { NormalizedOrder, ShipmentStatus } from '../couriers/shipment.types
 import { Batch } from './batch.model';
 import { TrackingHistory } from './tracking-history.model';
 
+/** RETURNING * yields snake_case columns; maps them onto entity properties. */
+export function rowToOrder(row: Record<string, unknown>): Partial<Order> {
+  return {
+    id: row.id as string,
+    orderId: row.order_id as string,
+    batchId: (row.batch_id as string | null) ?? null,
+    courierPartner: row.courier_partner as string,
+    status: row.status as ShipmentStatus,
+    awb: (row.awb as string | null) ?? null,
+    courierOrderId: (row.courier_order_id as string | null) ?? null,
+    normalizedPayload: row.normalized_payload as NormalizedOrder,
+    attemptCount: row.attempt_count as number,
+    createdAt: row.created_at as Date,
+    updatedAt: row.updated_at as Date,
+  };
+}
+
 @Entity('orders')
 @Index('idx_orders_status_updated', ['status', 'updatedAt'])
 @Index('idx_orders_batch', ['batchId'])

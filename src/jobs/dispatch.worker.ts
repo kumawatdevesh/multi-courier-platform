@@ -1,7 +1,8 @@
 import type { DataSource, Repository } from 'typeorm';
 
+import { ERROR_MESSAGES } from '../errors/error-codes';
 import { logger } from '../lib/logger';
-import { Order } from '../models/order.model';
+import { Order, rowToOrder } from '../models/order.model';
 import type { BatchService } from '../services/batch.service';
 import type { OrderService } from '../services/order.service';
 
@@ -9,6 +10,8 @@ export interface WorkerOptions {
   pollMs: number;
   batchSize: number;
   concurrencyPerPartner: number;
+  /** A row PROCESSING for longer than this was abandoned by a crash. */
+  stuckAfterMs: number;
 }
 
 /** Drains PENDING orders. The orders table is the queue; SKIP LOCKED lets workers share it. */
@@ -53,6 +56,7 @@ export class DispatchWorker {
 
   /** One pass; returns rows claimed. */
   async runOnce(): Promise<number> {
+    await this.reconcileStuck();
     const claimed = await this.claim();
     if (claimed.length === 0) return 0;
 
@@ -89,7 +93,34 @@ export class DispatchWorker {
       )
       .returning('*')
       .execute();
-    return (raw as Record<string, unknown>[]).map((row) => this.orders.create(fromRow(row)));
+    return (raw as Record<string, unknown>[]).map((row) => this.orders.create(rowToOrder(row)));
+  }
+
+  /**
+   * The courier call runs outside the claim lock (at-most-once), so a crash mid-call leaves
+   * the row PROCESSING. It is never re-dispatched — the courier may hold an AWB we never
+   * saw — but it must not stay invisible either: mark it FAILED with a reason so the batch
+   * completes and an operator can confirm with the courier and resubmit.
+   */
+  private async reconcileStuck(): Promise<void> {
+    const cutoff = new Date(Date.now() - this.opts.stuckAfterMs);
+    const { raw } = await this.orders
+      .createQueryBuilder()
+      .update()
+      .set({
+        status: 'FAILED',
+        lastError: () =>
+          `jsonb_build_object('code', 'DISPATCH_INTERRUPTED', 'message', :msg::text, 'at', now())`,
+      })
+      .setParameter('msg', ERROR_MESSAGES.DISPATCH_INTERRUPTED)
+      .where('status = :s AND updated_at < :cutoff', { s: 'PROCESSING', cutoff })
+      .returning('id, batch_id')
+      .execute();
+
+    const rows = raw as Array<{ id: string; batch_id: string | null }>;
+    if (rows.length === 0) return;
+    logger.warn({ orderIds: rows.map((r) => r.id) }, 'stuck PROCESSING orders marked FAILED');
+    await this.batchService.closeCompleted(rows.flatMap((r) => (r.batch_id ? [r.batch_id] : [])));
   }
 
   private async dispatchOne(order: Order): Promise<void> {
@@ -114,20 +145,4 @@ async function runBounded<T>(
     }
   });
   await Promise.all(lanes);
-}
-
-/** RETURNING * yields snake_case columns. */
-function fromRow(row: Record<string, unknown>): Partial<Order> {
-  return {
-    id: row.id as string,
-    orderId: row.order_id as string,
-    batchId: (row.batch_id as string | null) ?? null,
-    courierPartner: row.courier_partner as string,
-    status: row.status as Order['status'],
-    awb: (row.awb as string | null) ?? null,
-    normalizedPayload: row.normalized_payload as Order['normalizedPayload'],
-    attemptCount: row.attempt_count as number,
-    createdAt: row.created_at as Date,
-    updatedAt: row.updated_at as Date,
-  };
 }

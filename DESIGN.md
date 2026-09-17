@@ -100,9 +100,17 @@ through the same `OrderService.dispatch()` the single-create path uses. A batch 
 `COMPLETED` when none of its orders remain in flight; `GET /batches/:id` lists per-order
 `status`, `awb` and `error.code`.
 
-**`PROCESSING` exists for one reason.** If the process dies mid-call the courier may already
-have issued an AWB, so a row left `PROCESSING` is never re-claimed — it is the input to the
-reconciliation query, not to a retry.
+**Crash recovery — the lock is not the job state.** `FOR UPDATE SKIP LOCKED` holds a row
+lock only for the claim transaction; the courier call runs *after* commit, with `PROCESSING`
+as our own durable marker. That is a deliberate at-most-once choice: had the call run inside
+the lock, a worker crash would release the lock and another worker would re-claim and
+possibly ship the same order twice. Outside the lock, a crash instead leaves the row
+`PROCESSING`. Two things handle that: the worker sweeps rows `PROCESSING` longer than
+`RECONCILE_STUCK_AFTER_MS` (default 5 min) to `FAILED` with `DISPATCH_INTERRUPTED`, so the
+batch completes and the order is visible with a reason rather than lost; and resubmitting a
+`FAILED` `order_id` retries it (atomically — `UPDATE … WHERE status = 'FAILED'`, so concurrent
+resubmits produce one dispatch). Nothing re-dispatches an interrupted row automatically: the
+courier may hold an AWB we never received, and only a check with the courier can say.
 
 **Trade-offs.** 202 over synchronous: 100 orders at ~2 s, 10 in parallel, is ~20 s — past
 gateway timeouts, and a courier outage would pin the request. Postgres `SKIP LOCKED` over
@@ -126,6 +134,7 @@ One shape from every endpoint, rendered by a single error middleware:
 `INVALID_ORDER_STATE` · `ORDER_NOT_FOUND` · `COURIER_AUTH_FAILED` · `COURIER_REJECTED`
 (courier 4xx or failure envelope — vendor text stays in `last_error`, never in the response)
 · `COURIER_UNAVAILABLE` / `COURIER_TIMEOUT` (after retries; row persisted `FAILED`) ·
+`DISPATCH_INTERRUPTED` (worker crash; see §5) ·
 `RATE_LIMITED` · `PAYLOAD_TOO_LARGE` · `INTERNAL_ERROR`. Every failure logs
 `{ requestId, orderId, courierPartner, errorCode, errorType, durationMs }`, with a stack for
 5xx and the wrapped `cause` for foreign errors — not for deliberate 4xx, where it is noise.

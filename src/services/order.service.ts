@@ -14,7 +14,7 @@ import {
 import { AppError } from '../errors/app-error';
 import { CourierError } from '../errors/courier-error';
 import { logger } from '../lib/logger';
-import { Order } from '../models/order.model';
+import { Order, rowToOrder } from '../models/order.model';
 import { TrackingHistory } from '../models/tracking-history.model';
 
 /** Courier-agnostic: no partner name, no switch. Adding a courier changes nothing here. */
@@ -221,6 +221,8 @@ export class OrderService {
     } catch (error) {
       const pg = error as { code?: string; constraint?: string };
       if (pg.code === '23505' && pg.constraint === 'idx_orders_order_id') {
+        const retried = await this.reclaimFailed(input, courierPartner, status, batchId);
+        if (retried) return retried;
         throw new AppError(
           'DUPLICATE_ORDER',
           `An order with order_id "${input.orderId}" already exists`,
@@ -233,6 +235,39 @@ export class OrderService {
       }
       throw error;
     }
+  }
+
+  /**
+   * A FAILED order has zero shipments, so resubmitting it is a retry, not a duplicate: take
+   * it back with the new payload. The WHERE on status makes this atomic — of N concurrent
+   * resubmits exactly one wins; the rest see the row in flight and get the 409.
+   */
+  private async reclaimFailed(
+    input: NormalizedOrder,
+    courierPartner: string,
+    status: 'PENDING' | 'PROCESSING',
+    batchId: string | null,
+  ): Promise<Order | null> {
+    const { raw } = await this.orders
+      .createQueryBuilder()
+      .update()
+      .set({
+        status,
+        batchId,
+        courierPartner,
+        normalizedPayload: input,
+        lastError: null,
+        awb: null,
+        courierOrderId: null,
+      } as QueryDeepPartialEntity<Order>)
+      .where('order_id = :orderId AND status = :failed', {
+        orderId: input.orderId,
+        failed: 'FAILED',
+      })
+      .returning('*')
+      .execute();
+    const row = (raw as Record<string, unknown>[])[0];
+    return row ? this.orders.create(rowToOrder(row)) : null;
   }
 
   /**

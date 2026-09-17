@@ -188,13 +188,48 @@ describe('POST /api/v1/orders', () => {
       expect(persisted.status).toBe('FAILED');
     });
 
-    it('a FAILED order_id is still occupied — resubmitting is a 409, not a retry', async () => {
+    it('resubmitting a FAILED order retries it with the new payload — one row, now CREATED', async () => {
       const body = validOrder({ metadata: { mock: 'reject' } });
       await request(app).post('/api/v1/orders').send(body).expect(422);
-      await request(app)
-        .post('/api/v1/orders')
-        .send({ ...body, metadata: {} })
-        .expect(409);
+
+      const fixed = {
+        ...body,
+        metadata: {},
+        drop: { ...(body.drop as object), name: 'Corrected Name' },
+      };
+      const res = await request(app).post('/api/v1/orders').send(fixed).expect(201);
+      expect(res.body.data.status).toBe('CREATED');
+
+      const rows = await AppDataSource.query(
+        'SELECT status, last_error, normalized_payload FROM orders WHERE order_id = $1',
+        [body.order_id],
+      );
+      expect(rows).toHaveLength(1); // same row, not a second one
+      expect(rows[0].status).toBe('CREATED');
+      expect(rows[0].last_error).toBeNull();
+      expect(rows[0].normalized_payload.drop.name).toBe('Corrected Name'); // carries the fix
+    });
+
+    it('resubmitting a CREATED order is still a 409 — it has a shipment', async () => {
+      const body = validOrder();
+      await request(app).post('/api/v1/orders').send(body).expect(201);
+      await request(app).post('/api/v1/orders').send(body).expect(409);
+    });
+
+    it('concurrent resubmits of a FAILED order dispatch exactly once', async () => {
+      const body = validOrder({ metadata: { mock: 'reject' } });
+      await request(app).post('/api/v1/orders').send(body).expect(422);
+
+      const retry = { ...body, metadata: { mock: 'slow' } };
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => request(app).post('/api/v1/orders').send(retry)),
+      );
+      expect(results.map((r) => r.status).sort()).toEqual([201, 409, 409, 409, 409]);
+      const [row] = await AppDataSource.query(
+        'SELECT attempt_count FROM orders WHERE order_id = $1',
+        [body.order_id],
+      );
+      expect(row.attempt_count).toBe(1);
     });
   });
 });
