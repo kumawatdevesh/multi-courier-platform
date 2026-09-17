@@ -18,7 +18,8 @@ interface UbTokenResponse {
 export function createTokenCache(config: CourierConfig): TokenCache {
   const username = requireCredential(config, 'username');
   const password = requireCredential(config, 'password');
-  const authClient = new CourierHttpClient(config);
+  // No retries here: this runs inside the outer request's retry loop, which would multiply them.
+  const authClient = new CourierHttpClient({ ...config, retryAttempts: 1 });
 
   return new TokenCache(
     async () => {

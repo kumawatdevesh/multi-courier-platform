@@ -178,6 +178,26 @@ describe('worker', () => {
     expect(counts).toEqual([{ status: 'CREATED', n: 30 }]);
   });
 
+  it('never claims a single-create order that is being dispatched inline (race)', async () => {
+    // The HTTP request inserts and dispatches in one go; the mock makes the dispatch slow.
+    // supertest is lazy — .then() is what actually sends the request.
+    const inFlight = request(app)
+      .post('/api/v1/orders')
+      .send(createOrderBody({ order_id: 'RACE-1', metadata: { mock: 'slow' } }))
+      .then((r) => r);
+    await new Promise((r) => setTimeout(r, 100)); // request is mid-dispatch now
+
+    expect(await worker.runOnce()).toBe(0); // nothing PENDING: the row is PROCESSING
+
+    const res = await inFlight;
+    expect(res.status).toBe(201);
+    const [row] = await AppDataSource.query(
+      "SELECT status, attempt_count FROM orders WHERE order_id='RACE-1'",
+    );
+    expect(row).toEqual({ status: 'CREATED', attempt_count: 1 }); // dispatched exactly once
+    expect(res.body.data.awb).toMatch(/^MOCK/);
+  });
+
   it('a row stuck in PROCESSING is never re-claimed — it belongs to reconciliation', async () => {
     const res = await submit([createOrderBody({ order_id: 'STUCK' })]).expect(202);
     await AppDataSource.query("UPDATE orders SET status='PROCESSING' WHERE order_id='STUCK'"); // simulate a crash mid-dispatch

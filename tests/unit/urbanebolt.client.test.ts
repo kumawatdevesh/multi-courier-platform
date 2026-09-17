@@ -1,6 +1,7 @@
 import nock from 'nock';
 import { describe, expect, it } from 'vitest';
 
+import { AUTH_PATH } from '../../src/couriers/urbanebolt/urbanebolt.auth';
 import { PATHS, UrbaneBoltClient } from '../../src/couriers/urbanebolt/urbanebolt.client';
 import { BASE, courierConfig, stubAuth, testContext, useNock } from '../helpers/courier';
 
@@ -138,6 +139,17 @@ describe('UrbaneBoltClient — envelope handling', () => {
       expect(err.code).toBe('COURIER_REJECTED');
       expect(err.message).not.toContain('rider');
     });
+  });
+
+  it('a courier outage during auth costs one auth call per outer attempt, not three', async () => {
+    const auth = nock(BASE).post(AUTH_PATH).times(3).reply(503, 'down');
+    const { ctx } = testContext();
+    await expect(new UrbaneBoltClient(courierConfig()).track('1', ctx)).rejects.toMatchObject({
+      code: 'COURIER_UNAVAILABLE',
+    });
+    // outer loop: 3 attempts; each triggers exactly one getToken — 3 total, never 9
+    expect(auth.isDone()).toBe(true);
+    expect(nock.pendingMocks()).toEqual([]);
   });
 
   it('a real 401 triggers re-auth and a replay', async () => {

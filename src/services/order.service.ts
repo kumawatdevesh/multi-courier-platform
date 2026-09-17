@@ -27,14 +27,17 @@ export class OrderService {
     this.tracking = dataSource.getRepository(TrackingHistory);
   }
 
-  /** resolve courier → INSERT PENDING → dispatch. No transaction spans the courier call. */
+  /**
+   * resolve courier → INSERT → dispatch inline. Inserted as PROCESSING, not PENDING: the row
+   * is in flight from the start, and PENDING is what the bulk worker claims.
+   */
   async createOrder(
     input: NormalizedOrder,
     courierPartner: string,
     requestId: string,
   ): Promise<Order> {
     const adapter = this.adapterForRequest(courierPartner);
-    const order = await this.insertPending(input, adapter.key);
+    const order = await this.insertOrder(input, adapter.key, 'PROCESSING');
     return this.dispatch(order, requestId);
   }
 
@@ -198,16 +201,17 @@ export class OrderService {
    * Duplicates are rejected by the unique index, not a prior SELECT, so concurrent requests
    * cannot both pass. insert() rather than save(): save() wraps one INSERT in a transaction.
    */
-  private async insertPending(
+  private async insertOrder(
     input: NormalizedOrder,
     courierPartner: string,
+    status: 'PENDING' | 'PROCESSING',
     batchId: string | null = null,
   ): Promise<Order> {
     const fields = {
       orderId: input.orderId,
       batchId,
       courierPartner,
-      status: 'PENDING' as const,
+      status,
       normalizedPayload: input,
       attemptCount: 0,
     };

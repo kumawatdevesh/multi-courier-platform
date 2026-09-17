@@ -49,6 +49,9 @@ const DIRECTIVES: Record<string, SimulatedFailure> = {
 
 const RANDOM_OUTAGE: SimulatedFailure = { code: 'COURIER_UNAVAILABLE', response: { status: 503 } };
 
+/** `metadata.mock = 'slow'` makes createShipment take this long — for testing in-flight races. */
+const SLOW_MS = 400;
+
 const MAX_SHIPMENTS = 10_000;
 
 interface MockShipment {
@@ -73,6 +76,10 @@ class MockCourierAdapter implements CourierAdapter {
   async createShipment(order: NormalizedOrder, ctx: CourierContext): Promise<ShipmentResult> {
     const directive = typeof order.metadata?.mock === 'string' ? order.metadata.mock : undefined;
     const request = { orderNumber: order.orderId, consignee: order.drop.name, directive };
+
+    if (directive === 'slow') {
+      await new Promise((resolve) => setTimeout(resolve, SLOW_MS));
+    }
 
     const failure =
       (directive && DIRECTIVES[directive]) ||
