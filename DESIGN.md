@@ -145,7 +145,8 @@ One shape from every endpoint, rendered by a single error middleware:
 
 `VALIDATION_ERROR` · `UNKNOWN_COURIER` (lists supported couriers) · `DUPLICATE_ORDER` (409;
 carries `existing: { id, status, awb }` so the caller can go straight to the shipment) ·
-`INVALID_ORDER_STATE` · `ORDER_NOT_FOUND` · `COURIER_AUTH_FAILED` · `COURIER_REJECTED`
+`INVALID_ORDER_STATE` · `ORDER_NOT_FOUND` · `NOT_FOUND` (unmatched route, same envelope) ·
+`COURIER_AUTH_FAILED` · `COURIER_REJECTED`
 (courier 4xx or failure envelope — vendor text stays in `last_error`, never in the response)
 · `COURIER_UNAVAILABLE` / `COURIER_TIMEOUT` (after retries; row persisted `FAILED`) ·
 `DISPATCH_INTERRUPTED` (worker crash; see §5) ·
