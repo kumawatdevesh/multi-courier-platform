@@ -45,6 +45,7 @@ const DIRECTIVES: Record<string, SimulatedFailure> = {
     response: { status: 'Failed' },
   },
   'auth-fail': { code: 'COURIER_AUTH_FAILED', response: { status: 401 } },
+  unavailable: { code: 'COURIER_UNAVAILABLE', response: { status: 503 } },
 };
 
 const RANDOM_OUTAGE: SimulatedFailure = { code: 'COURIER_UNAVAILABLE', response: { status: 503 } };
@@ -58,6 +59,8 @@ interface MockShipment {
   step: number;
   cancelled: boolean;
   createdAt: number;
+  /** `metadata.mock = 'unknown-status'`: tracking reports a code the status map does not know. */
+  unknownStatus: boolean;
 }
 
 /** Deterministic in-memory partner for tests and local dev; state does not survive a restart. */
@@ -99,7 +102,12 @@ class MockCourierAdapter implements CourierAdapter {
     if (this.shipments.size >= MAX_SHIPMENTS) {
       this.shipments.delete(this.shipments.keys().next().value!);
     }
-    this.shipments.set(awb, { step: 0, cancelled: false, createdAt: Date.now() });
+    this.shipments.set(awb, {
+      step: 0,
+      cancelled: false,
+      createdAt: Date.now(),
+      unknownStatus: directive === 'unknown-status',
+    });
 
     // Mints its own id, unlike UrbaneBolt.
     const result: ShipmentResult = {
@@ -124,6 +132,18 @@ class MockCourierAdapter implements CourierAdapter {
     );
     if (shipment.cancelled) {
       events.push(this.event(shipment, 'CANCELLED', shipment.step + 1));
+    }
+
+    if (shipment.unknownStatus) {
+      // A code the map has never seen: kept with status null, never guessed at.
+      events.push({
+        status: null,
+        courierStatusCode: 'MOCK_ZZZ',
+        courierStatusText: 'something new',
+        location: 'Mock Hub',
+        occurredAt: new Date(shipment.createdAt + (shipment.step + 2) * 3_600_000),
+        raw: { status: 'ZZZ' },
+      });
     }
 
     const current = events.at(-1)!;

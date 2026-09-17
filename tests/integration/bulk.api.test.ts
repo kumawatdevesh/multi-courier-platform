@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import type { Express } from 'express';
+import nock from 'nock';
 import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
@@ -184,6 +185,72 @@ describe('worker', () => {
     expect(JSON.stringify(view)).not.toContain('MOCK: rejected');
   });
 
+  it('100 orders: 202, then every one dispatched', async () => {
+    const res = await submit(Array.from({ length: 100 }, () => createOrderBody())).expect(202);
+    expect(res.body.data).toMatchObject({ total: 100, accepted: 100 });
+    await drain();
+    expect(await statusCounts(res.body.data.batchId)).toEqual([{ status: 'CREATED', n: 100 }]);
+    expect((await getBatch(res.body.data.batchId)).body.data).toMatchObject({
+      status: 'COMPLETED',
+      succeeded: 100,
+      failed: 0,
+    });
+  });
+
+  it('mixed couriers in one batch: each order goes to its own partner', async () => {
+    nock.disableNetConnect();
+    nock.enableNetConnect(/127\.0\.0\.1|localhost/);
+    try {
+      nock('https://courier.test')
+        .post('/api/v1/auth/getToken/')
+        .reply(200, { access_token: 'T', expires_in: 86400 });
+      nock('https://courier.test')
+        .post('/api/v1/services/manifest/')
+        .times(2)
+        .reply(200, (_uri, body) => ({
+          status: 'Success',
+          successResponse: [
+            {
+              status: 'Success',
+              orderNumber: (body as Array<{ orderNumber: string }>)[0]!.orderNumber,
+              awbNumber: 200000001000 + Math.floor(Math.random() * 1000),
+            },
+          ],
+          errorResponse: [],
+        }));
+
+      const res = await submit([
+        createOrderBody({ order_id: 'MIX-m1' }),
+        createOrderBody({ order_id: 'MIX-u1', courier_partner: 'urbanebolt' }),
+        createOrderBody({ order_id: 'MIX-m2' }),
+        createOrderBody({ order_id: 'MIX-u2', courier_partner: 'urbanebolt' }),
+      ]).expect(202);
+      await drain();
+
+      const rows: Array<{
+        order_id: string;
+        courier_partner: string;
+        status: string;
+        awb: string;
+      }> = await AppDataSource.query(
+        'SELECT order_id, courier_partner, status, awb FROM orders WHERE batch_id=$1 ORDER BY order_id',
+        [res.body.data.batchId],
+      );
+      expect(rows.map((r) => [r.order_id, r.courier_partner, r.status])).toEqual([
+        ['MIX-m1', 'mock', 'CREATED'],
+        ['MIX-m2', 'mock', 'CREATED'],
+        ['MIX-u1', 'urbanebolt', 'CREATED'],
+        ['MIX-u2', 'urbanebolt', 'CREATED'],
+      ]);
+      expect(rows.filter((r) => r.awb.startsWith('MOCK'))).toHaveLength(2);
+      expect(rows.filter((r) => /^2000000/.test(r.awb))).toHaveLength(2);
+      expect(nock.isDone()).toBe(true);
+    } finally {
+      nock.cleanAll();
+      nock.enableNetConnect();
+    }
+  });
+
   it('claims in chunks of batchSize and reports how many it took', async () => {
     await submit(Array.from({ length: 25 }, () => createOrderBody())).expect(202);
     expect(await worker.runOnce()).toBe(20);
@@ -301,6 +368,41 @@ describe('worker', () => {
       error: { code: 'COURIER_UNAVAILABLE' },
     });
     expect(byId['FINE']).toMatchObject({ status: 'CREATED' });
+  });
+});
+
+describe('GET /api/v1/batches/:batchId — states', () => {
+  it('QUEUED → PROCESSING (live counts) → COMPLETED', async () => {
+    const res = await submit(Array.from({ length: 25 }, () => createOrderBody())).expect(202);
+    const id = res.body.data.batchId;
+    expect((await getBatch(id)).body.data).toMatchObject({ status: 'QUEUED', pending: 25 });
+    await worker.runOnce(); // 20 of 25
+    expect((await getBatch(id)).body.data).toMatchObject({
+      status: 'PROCESSING',
+      succeeded: 20,
+      pending: 5,
+      failed: 0,
+    });
+    await drain();
+    expect((await getBatch(id)).body.data).toMatchObject({
+      status: 'COMPLETED',
+      succeeded: 25,
+      pending: 0,
+    });
+  });
+
+  it('a batch where every order failed still COMPLETES, with reasons', async () => {
+    const res = await submit([
+      createOrderBody({ metadata: { mock: 'reject' } }),
+      createOrderBody({ metadata: { mock: 'timeout' } }),
+    ]).expect(202);
+    await drain();
+    const view = (await getBatch(res.body.data.batchId)).body.data;
+    expect(view).toMatchObject({ status: 'COMPLETED', succeeded: 0, failed: 2, pending: 0 });
+    expect(view.orders.map((o: { error: { code: string } }) => o.error.code).sort()).toEqual([
+      'COURIER_REJECTED',
+      'COURIER_TIMEOUT',
+    ]);
   });
 });
 

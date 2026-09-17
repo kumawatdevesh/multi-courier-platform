@@ -141,7 +141,7 @@ UrbaneBolt needs `_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`; the mock needs noth
 ## Testing
 
 ```bash
-npm test              # everything: 72 unit + 43 integration, ~3 s, no network
+npm test              # everything: 72 unit + 54 integration, ~4 s, no network
 npm run test:unit     # retry, token cache, HTTP client (nock), UrbaneBolt mapping, DTOs, errors
 npm run test:int      # real Express + Postgres, mock courier: orders, tracking, cancel, bulk, worker
 npm run check         # typecheck (src + tests) + prettier --check + all tests

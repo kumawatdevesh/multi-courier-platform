@@ -1,7 +1,8 @@
 import 'reflect-metadata';
 import type { Express } from 'express';
 import request from 'supertest';
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import nock from 'nock';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app';
 import { AppDataSource } from '../../src/db/data-source';
@@ -35,10 +36,17 @@ const history = (id: string) =>
 describe('GET /health and /api/v1/couriers', () => {
   it('reports the registered couriers', async () => {
     const health = await request(app).get('/health').expect(200);
-    expect(health.body).toMatchObject({ status: 'ok', database: 'up', couriers: ['mock'] });
+    expect(health.body).toMatchObject({
+      status: 'ok',
+      database: 'up',
+      couriers: ['mock', 'urbanebolt'],
+    });
 
     const couriers = await request(app).get('/api/v1/couriers').expect(200);
-    expect(couriers.body.data.couriers).toEqual([{ key: 'mock', displayName: 'Mock Courier' }]);
+    expect(couriers.body.data.couriers).toEqual([
+      { key: 'mock', displayName: 'Mock Courier' },
+      { key: 'urbanebolt', displayName: 'UrbaneBolt' },
+    ]);
   });
 });
 
@@ -105,7 +113,7 @@ describe('POST /api/v1/orders', () => {
       details: [
         {
           field: 'courier_partner',
-          message: 'Supported couriers: mock',
+          message: 'Supported couriers: mock, urbanebolt',
           rejectedValue: 'delhivery',
         },
       ],
@@ -177,6 +185,28 @@ describe('POST /api/v1/orders', () => {
       expect(persisted.response_payload).not.toBeNull();
     });
 
+    it('courier 5xx → 503 COURIER_UNAVAILABLE after retries, row FAILED', async () => {
+      const body = validOrder({ metadata: { mock: 'unavailable' } });
+      const res = await request(app).post('/api/v1/orders').send(body).expect(503);
+      expect(res.body.error.code).toBe('COURIER_UNAVAILABLE');
+      const [r] = await AppDataSource.query(
+        'SELECT status, last_error FROM orders WHERE order_id = $1',
+        [body.order_id],
+      );
+      expect(r.status).toBe('FAILED');
+      expect(r.last_error.code).toBe('COURIER_UNAVAILABLE');
+    });
+
+    it('courier auth failure → 502 COURIER_AUTH_FAILED, row FAILED', async () => {
+      const body = validOrder({ metadata: { mock: 'auth-fail' } });
+      const res = await request(app).post('/api/v1/orders').send(body).expect(502);
+      expect(res.body.error.code).toBe('COURIER_AUTH_FAILED');
+      const [r] = await AppDataSource.query('SELECT status FROM orders WHERE order_id = $1', [
+        body.order_id,
+      ]);
+      expect(r.status).toBe('FAILED');
+    });
+
     it('timeout → 504 COURIER_TIMEOUT, row FAILED', async () => {
       const body = validOrder({ metadata: { mock: 'timeout' } });
       const res = await request(app).post('/api/v1/orders').send(body).expect(504);
@@ -234,6 +264,86 @@ describe('POST /api/v1/orders', () => {
   });
 });
 
+describe('POST /api/v1/orders — UrbaneBolt end to end (UAT answered by nock)', () => {
+  const BASE = 'https://courier.test';
+  const AUTH = '/api/v1/auth/getToken/';
+  const MANIFEST = '/api/v1/services/manifest/';
+  const token = (t: string) =>
+    nock(BASE).post(AUTH).reply(200, { access_token: t, expires_in: 86400 });
+
+  beforeAll(() => {
+    nock.disableNetConnect();
+    nock.enableNetConnect(/127\.0\.0\.1|localhost/); // supertest talks to the app over loopback
+  });
+  afterEach(() => nock.cleanAll());
+  afterAll(() => nock.enableNetConnect());
+
+  it('expired token → 401 → re-auth → replay → 201; courierOrderId and both payloads persisted', async () => {
+    token('DEAD');
+    nock(BASE, { reqheaders: { authorization: 'Bearer DEAD' } })
+      .post(MANIFEST)
+      .reply(401, { detail: 'Authentication credentials were not provided.' });
+    token('LIVE');
+    nock(BASE, { reqheaders: { authorization: 'Bearer LIVE' } })
+      .post(MANIFEST)
+      .reply(200, {
+        status: 'Success',
+        successResponse: [
+          { status: 'Success', orderNumber: 'X', awbNumber: 200000009999, routeCode: 'GGN/DLHH' },
+        ],
+        errorResponse: [],
+      });
+
+    const body = validOrder({ courier_partner: 'urbanebolt' });
+    const res = await request(app).post('/api/v1/orders').send(body).expect(201);
+    expect(res.body.data).toMatchObject({
+      awb: '200000009999',
+      courierOrderId: 'X',
+      status: 'CREATED',
+    });
+    expect(nock.isDone()).toBe(true);
+
+    const [r] = await AppDataSource.query(
+      'SELECT courier_order_id, request_payload, response_payload FROM orders WHERE order_id = $1',
+      [body.order_id],
+    );
+    expect(r.courier_order_id).toBe('X');
+    expect(r.request_payload.body[0]).toMatchObject({
+      customerCode: 'TEST1',
+      orderNumber: body.order_id,
+    });
+    expect(r.response_payload.body.successResponse[0].awbNumber).toBe(200000009999);
+  });
+
+  it('401 → re-auth → still 401 → 502 COURIER_AUTH_FAILED, exactly one replay', async () => {
+    // The adapter's TokenCache is shared across tests, so how many getToken calls happen
+    // depends on prior state; answer all of them and assert on the manifest calls only.
+    nock(BASE).persist().post(AUTH).reply(200, { access_token: 'ANY', expires_in: 86400 });
+    const manifest = nock(BASE).post(MANIFEST).times(2).reply(401, { detail: 'nope' });
+
+    const res = await request(app)
+      .post('/api/v1/orders')
+      .send(validOrder({ courier_partner: 'urbanebolt' }))
+      .expect(502);
+    expect(res.body.error.code).toBe('COURIER_AUTH_FAILED');
+    expect(manifest.isDone()).toBe(true); // first call + exactly one replay, no third
+  });
+
+  it('HTTP 200 + status:Failed → 422; vendor text kept out of the response, kept in last_error', async () => {
+    nock(BASE).persist().post(AUTH).reply(200, { access_token: 'ANY', expires_in: 86400 });
+    nock(BASE)
+      .post(MANIFEST)
+      .reply(200, { status: 'Failed', message: "'shprName' is a required property" });
+    const body = validOrder({ courier_partner: 'urbanebolt' });
+    const res = await request(app).post('/api/v1/orders').send(body).expect(422);
+    expect(JSON.stringify(res.body)).not.toContain('shprName');
+    const [r] = await AppDataSource.query('SELECT last_error FROM orders WHERE order_id = $1', [
+      body.order_id,
+    ]);
+    expect(r.last_error.rawResponse.message).toContain('shprName');
+  });
+});
+
 describe('GET /api/v1/orders/:orderId', () => {
   it('returns the order', async () => {
     const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
@@ -281,6 +391,38 @@ describe('GET /api/v1/orders/:orderId/track', () => {
     expect(event.created_at).toBeInstanceOf(Date);
     expect(event.courier_status_code).toBe('MOCK_CREATED');
     expect(event.raw_payload).toMatchObject({ step: 0 });
+  });
+
+  it('an unknown courier status is recorded with status null and leaves the order status alone', async () => {
+    const created = await request(app)
+      .post('/api/v1/orders')
+      .send(validOrder({ metadata: { mock: 'unknown-status' } }))
+      .expect(201);
+    const id = created.body.data.id;
+
+    const res = await request(app).get(`/api/v1/orders/${id}/track`).expect(200);
+    expect(res.body.data.events.at(-1)).toMatchObject({
+      status: null,
+      courierStatusCode: 'MOCK_ZZZ',
+      courierStatusText: 'something new',
+    });
+    expect(res.body.data.status).toBe('CREATED'); // not overwritten with a guess
+    expect((await history(id)).at(-1)).toMatchObject({
+      status: null,
+      courier_status_code: 'MOCK_ZZZ',
+    });
+    expect((await row(id)).status).toBe('CREATED');
+  });
+
+  it('courier failure during tracking → normalized error, order and history untouched', async () => {
+    const created = await request(app).post('/api/v1/orders').send(validOrder()).expect(201);
+    await AppDataSource.query("UPDATE orders SET awb='MOCK9999999999' WHERE id=$1", [
+      created.body.data.id,
+    ]);
+    const res = await request(app).get(`/api/v1/orders/${created.body.data.id}/track`).expect(404);
+    expect(res.body.error.code).toBe('ORDER_NOT_FOUND');
+    expect((await row(created.body.data.id)).status).toBe('CREATED');
+    expect(await history(created.body.data.id)).toHaveLength(0);
   });
 
   it('409 INVALID_ORDER_STATE for a FAILED order that has no AWB', async () => {
