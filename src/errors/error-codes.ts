@@ -53,6 +53,8 @@ export interface ErrorResponse {
     code: ErrorCode;
     message: string;
     details?: FieldError[] | undefined;
+    /** DUPLICATE_ORDER only: the order that already holds this order_id. */
+    existing?: { id: string; status: string; awb: string | null } | undefined;
     requestId: string;
     timestamp: string;
   };

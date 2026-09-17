@@ -17,7 +17,13 @@ import { Order } from './order.model';
  * courier returns its whole scan list each time and writers use .orIgnore().
  */
 @Entity('tracking_history')
-@Unique('uq_tracking_event', ['orderId', 'courierStatusCode', 'statusTimestamp'])
+@Unique('uq_tracking_event', [
+  'orderId',
+  'courierStatusCode',
+  'statusTimestamp',
+  'location',
+  'courierStatusText',
+])
 @Index('idx_tracking_order_time', ['orderId', 'statusTimestamp'])
 export class TrackingHistory {
   /** bigint reads back as a string in JS. */
@@ -39,11 +45,12 @@ export class TrackingHistory {
   @Column({ name: 'courier_status_code', type: 'text' })
   courierStatusCode!: string;
 
-  @Column({ name: 'courier_status_text', type: 'text', nullable: true })
-  courierStatusText!: string | null;
+  /** '' rather than null so it can take part in the unique constraint. */
+  @Column({ name: 'courier_status_text', type: 'text', default: '' })
+  courierStatusText!: string;
 
-  @Column({ type: 'text', nullable: true })
-  location!: string | null;
+  @Column({ type: 'text', default: '' })
+  location!: string;
 
   /** When the courier says the scan happened. */
   @Column({ name: 'status_timestamp', type: 'timestamptz' })

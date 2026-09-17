@@ -143,6 +143,8 @@ describe('POST /api/v1/orders', () => {
       expect(second.body.error).toMatchObject({
         code: 'DUPLICATE_ORDER',
         details: [{ field: 'order_id', rejectedValue: body.order_id }],
+        // the 409 is actionable: it says where the existing shipment is
+        existing: { id: first.body.data.id, status: 'CREATED', awb: first.body.data.awb },
       });
       const rows = await AppDataSource.query('SELECT awb FROM orders WHERE order_id = $1', [
         body.order_id,
@@ -391,6 +393,26 @@ describe('GET /api/v1/orders/:orderId/track', () => {
     expect(event.created_at).toBeInstanceOf(Date);
     expect(event.courier_status_code).toBe('MOCK_CREATED');
     expect(event.raw_payload).toMatchObject({ step: 0 });
+  });
+
+  it('the same code in the same minute at two hubs is two events, not one', async () => {
+    const created = await request(app)
+      .post('/api/v1/orders')
+      .send(validOrder({ metadata: { mock: 'two-hubs' } }))
+      .expect(201);
+    const id = created.body.data.id;
+    await request(app).get(`/api/v1/orders/${id}/track`).expect(200); // PICKED_UP
+    await request(app).get(`/api/v1/orders/${id}/track`).expect(200); // IN_TRANSIT ×2 hubs
+    await request(app).get(`/api/v1/orders/${id}/track`).expect(200); // re-poll: nothing new
+
+    const rows = await history(id);
+    const inTransit = rows.filter((r: { status: string }) => r.status === 'IN_TRANSIT');
+    expect(inTransit).toHaveLength(2);
+    expect(inTransit.map((r: { location: string }) => r.location).sort()).toEqual([
+      'Mock Hub',
+      'Mock Hub 2',
+    ]);
+    expect(inTransit[0].status_timestamp).toEqual(inTransit[1].status_timestamp); // same minute
   });
 
   it('an unknown courier status is recorded with status null and leaves the order status alone', async () => {

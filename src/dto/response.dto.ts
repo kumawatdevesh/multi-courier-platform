@@ -41,8 +41,8 @@ export function toOrderView(order: Order): OrderView {
 export interface TrackingEventView {
   status: string | null;
   courierStatusCode: string;
-  courierStatusText: string | null;
-  location: string | null;
+  courierStatusText: string;
+  location: string;
   occurredAt: string;
 }
 

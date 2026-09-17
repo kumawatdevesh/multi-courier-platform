@@ -257,6 +257,11 @@ export class OrderService {
       if (pg.code === '23505' && pg.constraint === 'idx_orders_order_id') {
         const retried = await this.reclaimFailed(input, courierPartner, status, batchId);
         if (retried) return retried;
+        // Tell the caller where the existing shipment is, so a 409 is actionable.
+        const existing = await this.orders.findOne({
+          where: { orderId: input.orderId },
+          select: ['id', 'status', 'awb'],
+        });
         throw new AppError(
           'DUPLICATE_ORDER',
           `An order with order_id "${input.orderId}" already exists`,
@@ -264,6 +269,10 @@ export class OrderService {
             details: [
               { field: 'order_id', message: 'already submitted', rejectedValue: input.orderId },
             ],
+            context: { existingOrderId: existing?.id },
+            existing: existing
+              ? { id: existing.id, status: existing.status, awb: existing.awb }
+              : undefined,
           },
         );
       }
@@ -350,8 +359,8 @@ export class OrderService {
           orderId: order.id,
           status: event.status,
           courierStatusCode: event.courierStatusCode,
-          courierStatusText: event.courierStatusText,
-          location: event.location ?? null,
+          courierStatusText: event.courierStatusText ?? '',
+          location: event.location ?? '',
           statusTimestamp: event.occurredAt,
           rawPayload: event.raw,
         })) as QueryDeepPartialEntity<TrackingHistory>[],

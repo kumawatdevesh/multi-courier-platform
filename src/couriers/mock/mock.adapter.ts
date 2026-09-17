@@ -61,6 +61,8 @@ interface MockShipment {
   createdAt: number;
   /** `metadata.mock = 'unknown-status'`: tracking reports a code the status map does not know. */
   unknownStatus: boolean;
+  /** `metadata.mock = 'two-hubs'`: the same scan code twice in one minute, at different hubs. */
+  twoHubs: boolean;
 }
 
 /** Deterministic in-memory partner for tests and local dev; state does not survive a restart. */
@@ -107,6 +109,7 @@ class MockCourierAdapter implements CourierAdapter {
       cancelled: false,
       createdAt: Date.now(),
       unknownStatus: directive === 'unknown-status',
+      twoHubs: directive === 'two-hubs',
     });
 
     // Mints its own id, unlike UrbaneBolt.
@@ -144,6 +147,12 @@ class MockCourierAdapter implements CourierAdapter {
         occurredAt: new Date(shipment.createdAt + (shipment.step + 2) * 3_600_000),
         raw: { status: 'ZZZ' },
       });
+    }
+
+    if (shipment.twoHubs && shipment.step >= 2) {
+      // Same IN_TRANSIT code, same timestamp as the real one, different hub.
+      const twin = events.find((e) => e.status === 'IN_TRANSIT')!;
+      events.push({ ...twin, location: 'Mock Hub 2', raw: { ...(twin.raw as object), hub: 2 } });
     }
 
     const current = events.at(-1)!;

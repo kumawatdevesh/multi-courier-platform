@@ -73,6 +73,7 @@ export function errorHandler(
       code: appError.code,
       message: appError.message,
       details: appError.details,
+      existing: appError.existing,
       requestId,
       timestamp: new Date().toISOString(),
     },

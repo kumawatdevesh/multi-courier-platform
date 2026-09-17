@@ -72,8 +72,12 @@ the **create** call; track and cancel are audited in `tracking_history` and `las
 **`tracking_history`** — append-only: `order_id fk`, `status` (nullable), `courier_status_code`,
 `courier_status_text`, `location`, `status_timestamp`, `raw_payload`, `created_at`. Two
 timestamps because couriers backfill scans late and reconciliation must tell "happened late"
-from "arrived late". `UNIQUE (order_id, courier_status_code, status_timestamp)` makes polling
-idempotent: the courier returns its whole scan list each call and writers use `.orIgnore()`.
+from "arrived late". Polling is idempotent — the courier returns its whole scan list each
+call and writers use `.orIgnore()` — against `UNIQUE (order_id, courier_status_code,
+status_timestamp, location, courier_status_text)`: the whole scan, not just code + time, so
+the same code in the same minute at two hubs is two events. `location` and
+`courier_status_text` are `NOT NULL DEFAULT ''` so they can take part (Postgres treats
+`NULL <> NULL` in a unique index).
 
 **`batches`** — `id`, `total`, `accepted`, `status` (`QUEUED · PROCESSING · COMPLETED`),
 `created_at`, `completed_at`. Per-order outcomes are read from the child orders, so there is
@@ -126,7 +130,12 @@ gateway timeouts, and a courier outage would pin the request. Postgres `SKIP LOC
 BullMQ/Redis: no extra service and the job *is* the order row (no dual-write), at the cost of
 ~1 s poll latency, irrelevant at this volume. Rejected streaming (NDJSON): pins a connection
 and loses results on disconnect. In-process worker: one thing to run; `WORKER_ENABLED=false`
-on API replicas plus a worker-only replica is the split when scale demands it.
+on API replicas plus a worker-only replica is the split when scale demands it. A 1 s poller
+over a cron: an hourly cron would leave a `202`'d batch `pending` for up to an hour, which
+defeats the point of accepting it asynchronously; an idle tick costs one indexed `UPDATE …
+LIMIT 20` per second. Cron is the right shape for hygiene work — a reconciliation report of
+`DISPATCH_INTERRUPTED` / `DUPLICATE_ORDER` rows, refreshing `IN_TRANSIT` statuses nobody
+polls — and `runOnce()` is exposed so a one-shot entrypoint could drive dispatch that way too.
 
 ## 6. Errors
 
@@ -139,7 +148,8 @@ One shape from every endpoint, rendered by a single error middleware:
              "requestId": "req_01J8…", "timestamp": "2026-09-16T12:30:43Z" } }
 ```
 
-`VALIDATION_ERROR` · `UNKNOWN_COURIER` (lists supported couriers) · `DUPLICATE_ORDER` ·
+`VALIDATION_ERROR` · `UNKNOWN_COURIER` (lists supported couriers) · `DUPLICATE_ORDER` (409;
+carries `existing: { id, status, awb }` so the caller can go straight to the shipment) ·
 `INVALID_ORDER_STATE` · `ORDER_NOT_FOUND` · `COURIER_AUTH_FAILED` · `COURIER_REJECTED`
 (courier 4xx or failure envelope — vendor text stays in `last_error`, never in the response)
 · `COURIER_UNAVAILABLE` / `COURIER_TIMEOUT` (after retries; row persisted `FAILED`) ·
