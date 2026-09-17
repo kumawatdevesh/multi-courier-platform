@@ -82,26 +82,49 @@ Every request body carries `courier_partner`. The rest is our schema.
 
 ## Setup
 
+Requires Node 20+ and Docker (or any Postgres 14+; set `DATABASE_URL` to it and skip step 2).
+
 ```bash
-cp .env.example .env        # fill in courier credentials
-docker compose up -d db     # Postgres 16
-npm install
-npm run migration:run
-npm run dev                 # API + bulk worker on :3000
+cp .env.example .env            # 1. defaults work out of the box with the mock courier
+docker compose up -d db         # 2. Postgres 16 on :5432 (postgres/postgres, db multi_courier)
+npm install                     # 3.
+npm run migration:run           # 4. creates orders, tracking_history, batches
+npm run dev                     # 5. API + bulk worker on http://localhost:3000, reloads on change
 ```
+
+Then `curl localhost:3000/health` → `{ "status": "ok", "database": "up", "couriers": ["mock"] }`.
+
+To use UrbaneBolt, set `COURIER_URBANEBOLT_ENABLED=true` and the three credentials in `.env`
+(see below) and restart — no code change.
+
+## Running
+
+| command | what |
+|---|---|
+| `npm run dev` | tsx with file watching — for development |
+| `npm run build && npm start` | compiled `dist/`, no TypeScript at runtime — for production |
+| `WORKER_ENABLED=false npm start` | API only; run the worker in a separate replica |
+| `npm run migration:run` / `migration:revert` | apply / roll back the latest migration |
+
+The process handles `SIGTERM`: stops accepting connections, finishes in-flight courier calls
+and the current worker tick, closes the pool, exits 0.
 
 ## Environment variables
 
+All configuration comes from the environment (`.env` in development). Nothing is hardcoded;
+a missing required value fails at boot with the variable named, not at first request.
+
 | Variable | Default | Purpose |
 |---|---|---|
+| `NODE_ENV` | `development` | `development` · `test` · `production` |
 | `PORT` | `3000` | |
-| `DATABASE_URL` | — | Postgres connection string |
+| `DATABASE_URL` | — | Postgres connection string (required) |
 | `DB_POOL_SIZE` | `10` | TypeORM connection pool |
 | `WORKER_ENABLED` | `true` | run the bulk dispatch worker in this process |
 | `WORKER_POLL_MS` | `1000` | how often the worker looks for `PENDING` orders |
 | `WORKER_BATCH_SIZE` | `20` | rows claimed per tick |
 | `COURIER_CONCURRENCY` | `10` | max in-flight courier calls per partner per tick |
-| `LOG_LEVEL` | `info` | |
+| `LOG_LEVEL` | `info` | pino level; `silent` in tests |
 | `COURIER_<KEY>_ENABLED` | `false` | registers the adapter at boot |
 | `COURIER_<KEY>_BASE_URL` | — | |
 | `COURIER_<KEY>_TIMEOUT_MS` | `15000` | |
@@ -109,21 +132,23 @@ npm run dev                 # API + bulk worker on :3000
 | `COURIER_<KEY>_RETRY_BASE_DELAY_MS` | `250` | exponential backoff + jitter |
 | `COURIER_<KEY>_*` | — | anything else becomes `config.credentials` |
 
-For UrbaneBolt that means `COURIER_URBANEBOLT_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`.
-Nothing is hardcoded; an unset required credential fails fast at boot, not at first request.
+`COURIER_<KEY>_*` is resolved per partner by naming convention: `COURIER_URBANEBOLT_USERNAME`
+becomes `credentials.username` for the `urbanebolt` adapter, with no config code written for it.
+UrbaneBolt needs `_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`; the mock needs nothing.
 
 ## Testing
 
 ```bash
-npm test              # everything: 71 unit + 36 integration, ~2.5 s, no network
+npm test              # everything: 72 unit + 37 integration, ~3 s, no network
 npm run test:unit     # retry, token cache, HTTP client (nock), UrbaneBolt mapping, DTOs, errors
 npm run test:int      # real Express + Postgres, mock courier: orders, tracking, cancel, bulk, worker
 npm run check         # typecheck (src + tests) + prettier --check + all tests
 ```
 
 Integration tests need a database: `TEST_DATABASE_URL=postgres://…/multi_courier_test`
-(defaults to `postgres:postgres@localhost`). They run the migrations and truncate between
-tests. The `mock` adapter is steered by `metadata.mock` (`reject` · `timeout` · `duplicate` ·
+(defaults to `postgres:postgres@localhost:5432/multi_courier_test` — create it with
+`createdb multi_courier_test` or `docker compose exec db createdb -U postgres multi_courier_test`).
+They run the migrations and truncate between tests. The `mock` adapter is steered by `metadata.mock` (`reject` · `timeout` · `duplicate` ·
 `auth-fail`) and advances one lifecycle step per tracking poll.
 
 ## API examples
