@@ -114,10 +114,10 @@ describe('UrbaneBoltAdapter', () => {
       expect(payload.consAddress).toBe('12 MG Road, Near Park');
     });
 
-    it('stringifies the numeric awbNumber; courierOrderId is null since UrbaneBolt mints none', async () => {
+    it('stringifies the numeric awbNumber; courierOrderId is the echoed orderNumber', async () => {
       const { result } = await captureManifest();
       expect(result).toEqual({
-        courierOrderId: null,
+        courierOrderId: 'ORD-1',
         awb: '200000007895',
         labelUrl: 'https://label',
         routeCode: 'GGN/DLHH',

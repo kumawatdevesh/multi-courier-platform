@@ -43,8 +43,8 @@ class UrbaneBoltAdapter implements CourierAdapter {
     const created = await this.client.manifest(this.toManifestPayload(order), ctx);
 
     return {
-      // orderNumber is our own reference echoed back; UrbaneBolt mints no id of its own.
-      courierOrderId: null,
+      // UrbaneBolt mints no id of its own; orderNumber is our reference, echoed back.
+      courierOrderId: created.orderNumber,
       // awbNumber is a JSON number; String() rather than a cast avoids precision loss.
       awb: String(created.awbNumber),
       labelUrl: created.shippingLabel,

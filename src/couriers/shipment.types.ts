@@ -77,7 +77,7 @@ export interface NormalizedOrder {
 }
 
 export interface ShipmentResult {
-  /** Null when the courier mints no id of its own (UrbaneBolt echoes ours back). */
+  /** The courier's reference for the shipment; UrbaneBolt echoes our orderNumber back. */
   courierOrderId?: string | null | undefined;
   awb: string;
   labelUrl?: string | undefined;
