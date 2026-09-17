@@ -26,6 +26,7 @@ export function rowToOrder(row: Record<string, unknown>): Partial<Order> {
     courierOrderId: (row.courier_order_id as string | null) ?? null,
     normalizedPayload: row.normalized_payload as NormalizedOrder,
     attemptCount: row.attempt_count as number,
+    leaseUntil: (row.lease_until as Date | null) ?? null,
     createdAt: row.created_at as Date,
     updatedAt: row.updated_at as Date,
   };
@@ -34,6 +35,7 @@ export function rowToOrder(row: Record<string, unknown>): Partial<Order> {
 @Entity('orders')
 @Index('idx_orders_status_updated', ['status', 'updatedAt'])
 @Index('idx_orders_batch', ['batchId'])
+@Index('idx_orders_lease', ['status', 'leaseUntil'])
 export class Order {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
@@ -88,6 +90,10 @@ export class Order {
 
   @Column({ name: 'attempt_count', type: 'int', default: 0 })
   attemptCount!: number;
+
+  /** While PROCESSING: the moment this row may be re-claimed if its worker went silent. */
+  @Column({ name: 'lease_until', type: 'timestamptz', nullable: true })
+  leaseUntil!: Date | null;
 
   @OneToMany(() => TrackingHistory, (event) => event.order)
   trackingHistory!: TrackingHistory[];

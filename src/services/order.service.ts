@@ -18,11 +18,21 @@ import { Order, rowToOrder } from '../models/order.model';
 import { TrackingHistory } from '../models/tracking-history.model';
 
 /** Courier-agnostic: no partner name, no switch. Adding a courier changes nothing here. */
+export interface LeaseOptions {
+  /** How long a PROCESSING row is considered owned before another worker may take it. */
+  leaseMs: number;
+  /** How often an in-flight dispatch extends its lease. */
+  heartbeatMs: number;
+}
+
 export class OrderService {
   private readonly orders: Repository<Order>;
   private readonly tracking: Repository<TrackingHistory>;
 
-  constructor(dataSource: DataSource) {
+  constructor(
+    dataSource: DataSource,
+    private readonly lease: LeaseOptions,
+  ) {
     this.orders = dataSource.getRepository(Order);
     this.tracking = dataSource.getRepository(TrackingHistory);
   }
@@ -44,6 +54,7 @@ export class OrderService {
   /** Sends one order to its courier and persists the outcome. Shared by create and the worker. */
   async dispatch(order: Order, requestId: string): Promise<Order> {
     const { ctx, audit } = createCourierContext(requestId, order.id);
+    const heartbeat = this.startHeartbeat(order.id);
 
     try {
       // Inside the try so a partner disabled after submit persists FAILED like any other failure.
@@ -56,6 +67,7 @@ export class OrderService {
         labelUrl: result.labelUrl ?? null,
         routeCode: result.routeCode ?? null,
         lastError: null,
+        leaseUntil: null,
         ...audit.toOrderFields(),
       });
       logger.info(
@@ -74,6 +86,7 @@ export class OrderService {
       const appError = error instanceof AppError ? error : undefined;
       await this.patch(order, {
         status: 'FAILED',
+        leaseUntil: null,
         lastError:
           error instanceof CourierError
             ? error.toPersisted()
@@ -98,7 +111,27 @@ export class OrderService {
         'shipment creation failed',
       );
       throw error;
+    } finally {
+      clearInterval(heartbeat);
     }
+  }
+
+  /**
+   * Keeps the row's lease ahead of now() for as long as the courier call runs, so a slow
+   * dispatch is never mistaken for a dead one. Stops extending if the row has left
+   * PROCESSING (another worker reclaimed it, or it completed).
+   */
+  private startHeartbeat(orderId: string): NodeJS.Timeout {
+    const extend = () =>
+      this.orders
+        .createQueryBuilder()
+        .update()
+        .set({ leaseUntil: () => `now() + (${this.lease.leaseMs} * interval '1 ms')` })
+        .where('id = :id AND status = :s', { id: orderId, s: 'PROCESSING' })
+        .execute()
+        .catch((error) => logger.warn({ err: error, orderId }, 'lease heartbeat failed'));
+    // unref: a heartbeat must never keep the process alive during shutdown.
+    return setInterval(extend, this.lease.heartbeatMs).unref();
   }
 
   async getOrder(id: string): Promise<Order> {
@@ -214,6 +247,7 @@ export class OrderService {
       status,
       normalizedPayload: input,
       attemptCount: 0,
+      leaseUntil: status === 'PROCESSING' ? new Date(Date.now() + this.lease.leaseMs) : null,
     };
     try {
       const { generatedMaps } = await this.orders.insert(fields as QueryDeepPartialEntity<Order>);
@@ -259,6 +293,7 @@ export class OrderService {
         lastError: null,
         awb: null,
         courierOrderId: null,
+        leaseUntil: status === 'PROCESSING' ? new Date(Date.now() + this.lease.leaseMs) : null,
       } as QueryDeepPartialEntity<Order>)
       .where('order_id = :orderId AND status = :failed', {
         orderId: input.orderId,

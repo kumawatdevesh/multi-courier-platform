@@ -64,6 +64,7 @@ interface MockShipment {
 class MockCourierAdapter implements CourierAdapter {
   readonly key = 'mock';
   readonly displayName = 'Mock Courier';
+  readonly idempotentOnReference: boolean;
 
   private readonly shipments = new Map<string, MockShipment>();
   private readonly failureRate: number;
@@ -71,6 +72,7 @@ class MockCourierAdapter implements CourierAdapter {
 
   constructor(config: CourierConfig) {
     this.failureRate = Number(config.credentials.failureRate ?? 0);
+    this.idempotentOnReference = (config.credentials.idempotentOnReference ?? 'true') === 'true';
   }
 
   async createShipment(order: NormalizedOrder, ctx: CourierContext): Promise<ShipmentResult> {

@@ -1,5 +1,6 @@
 import type { DataSource, Repository } from 'typeorm';
 
+import { findCourier } from '../couriers/courier.registry';
 import { ERROR_MESSAGES } from '../errors/error-codes';
 import { logger } from '../lib/logger';
 import { Order, rowToOrder } from '../models/order.model';
@@ -10,11 +11,15 @@ export interface WorkerOptions {
   pollMs: number;
   batchSize: number;
   concurrencyPerPartner: number;
-  /** A row PROCESSING for longer than this was abandoned by a crash. */
-  stuckAfterMs: number;
+  /** How long a claim is owned before a silent worker's rows may be taken over. */
+  leaseMs: number;
 }
 
-/** Drains PENDING orders. The orders table is the queue; SKIP LOCKED lets workers share it. */
+/**
+ * Drains PENDING orders. The orders table is the queue; SKIP LOCKED lets workers share it.
+ * Ownership is a lease, not a lock: a claim sets lease_until, the dispatch heartbeats it,
+ * and a lapsed lease means the worker died mid-call.
+ */
 export class DispatchWorker {
   private readonly orders: Repository<Order>;
   private timer: NodeJS.Timeout | null = null;
@@ -22,12 +27,12 @@ export class DispatchWorker {
   private stopped = false;
 
   constructor(
-    private dataSource: DataSource,
+    dataSource: DataSource,
     private readonly orderService: OrderService,
     private readonly batchService: BatchService,
     private readonly opts: WorkerOptions,
   ) {
-    this.orders = this.dataSource.getRepository(Order);
+    this.orders = dataSource.getRepository(Order);
   }
 
   start(): void {
@@ -54,10 +59,9 @@ export class DispatchWorker {
     await this.tick;
   }
 
-  /** One pass; returns rows claimed. */
+  /** One pass; returns rows claimed (fresh + reclaimed). */
   async runOnce(): Promise<number> {
-    await this.reconcileStuck();
-    const claimed = await this.claim();
+    const claimed = [...(await this.reclaimExpired()), ...(await this.claim())];
     if (claimed.length === 0) return 0;
 
     const batchIds = claimed.flatMap((o) => (o.batchId ? [o.batchId] : []));
@@ -77,50 +81,74 @@ export class DispatchWorker {
     return claimed.length;
   }
 
+  /** Takes up to batchSize PENDING rows, marking them PROCESSING with a fresh lease. */
+  private claim(): Promise<Order[]> {
+    return this.take(`status = 'PENDING'`);
+  }
+
   /**
-   * A row left PROCESSING by a crash is never re-claimed: the courier may already have
-   * issued an AWB, so it belongs to reconciliation, not a retry.
+   * Takes over PROCESSING rows whose lease lapsed — their worker stopped heartbeating, i.e.
+   * died mid-call. The courier call ran outside any lock (at-most-once), so we cannot know
+   * whether it went through. Re-dispatch only where the partner rejects a duplicate
+   * reference, so the worst case is a DUPLICATE_ORDER failure rather than a second
+   * shipment; otherwise mark it FAILED for a person to confirm with the courier.
    */
-  private async claim(): Promise<Order[]> {
+  private async reclaimExpired(): Promise<Order[]> {
+    const expired = await this.take(`status = 'PROCESSING' AND lease_until < now()`);
+    if (expired.length === 0) return [];
+
+    const retry: Order[] = [];
+    const failedBatches: string[] = [];
+    for (const order of expired) {
+      const adapter = findCourier(order.courierPartner);
+      if (adapter?.idempotentOnReference) {
+        logger.warn(
+          { orderId: order.id, courierPartner: order.courierPartner },
+          'lease lapsed; re-dispatching',
+        );
+        retry.push(order);
+        continue;
+      }
+      logger.warn(
+        { orderId: order.id, courierPartner: order.courierPartner },
+        'lease lapsed; partner is not idempotent, marking FAILED',
+      );
+      await this.orders
+        .createQueryBuilder()
+        .update()
+        .set({
+          status: 'FAILED',
+          leaseUntil: null,
+          lastError: () =>
+            `jsonb_build_object('code', 'DISPATCH_INTERRUPTED', 'message', :msg::text, 'at', now())`,
+        })
+        .setParameter('msg', ERROR_MESSAGES.DISPATCH_INTERRUPTED)
+        .where('id = :id', { id: order.id })
+        .execute();
+      if (order.batchId) failedBatches.push(order.batchId);
+    }
+    // A batch whose last in-flight row just failed here must still complete.
+    await this.batchService.closeCompleted(failedBatches);
+    return retry;
+  }
+
+  /** The claim itself: lock, mark PROCESSING, set the lease, release — one statement. */
+  private async take(where: string): Promise<Order[]> {
     const { raw } = await this.orders
       .createQueryBuilder()
       .update()
-      .set({ status: 'PROCESSING' })
+      .set({
+        status: 'PROCESSING',
+        leaseUntil: () => `now() + (${this.opts.leaseMs} * interval '1 ms')`,
+      })
       .where(
-        `id IN (SELECT id FROM orders WHERE status = 'PENDING'
+        `id IN (SELECT id FROM orders WHERE ${where}
                 ORDER BY created_at LIMIT :limit FOR UPDATE SKIP LOCKED)`,
         { limit: this.opts.batchSize },
       )
       .returning('*')
       .execute();
     return (raw as Record<string, unknown>[]).map((row) => this.orders.create(rowToOrder(row)));
-  }
-
-  /**
-   * The courier call runs outside the claim lock (at-most-once), so a crash mid-call leaves
-   * the row PROCESSING. It is never re-dispatched — the courier may hold an AWB we never
-   * saw — but it must not stay invisible either: mark it FAILED with a reason so the batch
-   * completes and an operator can confirm with the courier and resubmit.
-   */
-  private async reconcileStuck(): Promise<void> {
-    const cutoff = new Date(Date.now() - this.opts.stuckAfterMs);
-    const { raw } = await this.orders
-      .createQueryBuilder()
-      .update()
-      .set({
-        status: 'FAILED',
-        lastError: () =>
-          `jsonb_build_object('code', 'DISPATCH_INTERRUPTED', 'message', :msg::text, 'at', now())`,
-      })
-      .setParameter('msg', ERROR_MESSAGES.DISPATCH_INTERRUPTED)
-      .where('status = :s AND updated_at < :cutoff', { s: 'PROCESSING', cutoff })
-      .returning('id, batch_id')
-      .execute();
-
-    const rows = raw as Array<{ id: string; batch_id: string | null }>;
-    if (rows.length === 0) return;
-    logger.warn({ orderIds: rows.map((r) => r.id) }, 'stuck PROCESSING orders marked FAILED');
-    await this.batchService.closeCompleted(rows.flatMap((r) => (r.batch_id ? [r.batch_id] : [])));
   }
 
   private async dispatchOne(order: Order): Promise<void> {

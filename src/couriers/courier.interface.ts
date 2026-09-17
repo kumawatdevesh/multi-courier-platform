@@ -30,6 +30,12 @@ export interface CourierAdapter {
   readonly key: string;
   readonly displayName: string;
 
+  /**
+   * True if the partner rejects a second createShipment for an orderId it has already
+   * shipped. Decides whether a dispatch interrupted by a crash may be retried automatically.
+   */
+  readonly idempotentOnReference: boolean;
+
   createShipment(order: NormalizedOrder, ctx: CourierContext): Promise<ShipmentResult>;
   trackShipment(ref: ShipmentRef, ctx: CourierContext): Promise<TrackingResult>;
 

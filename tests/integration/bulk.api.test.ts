@@ -4,6 +4,7 @@ import request from 'supertest';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 
 import { buildApp } from '../../src/app';
+import { findCourier } from '../../src/couriers/courier.registry';
 import { AppDataSource } from '../../src/db/data-source';
 import type { DispatchWorker } from '../../src/jobs/dispatch.worker';
 import { createOrderBody } from '../helpers/courier';
@@ -218,38 +219,66 @@ describe('worker', () => {
     expect(res.body.data.awb).toMatch(/^MOCK/);
   });
 
-  it('a row stuck in PROCESSING is never re-claimed — it belongs to reconciliation', async () => {
-    const res = await submit([createOrderBody({ order_id: 'STUCK' })]).expect(202);
-    await AppDataSource.query("UPDATE orders SET status='PROCESSING' WHERE order_id='STUCK'"); // simulate a crash mid-dispatch
+  it('a PROCESSING row with a live lease is never re-claimed', async () => {
+    const res = await submit([createOrderBody({ order_id: 'OWNED' })]).expect(202);
+    await AppDataSource.query(
+      "UPDATE orders SET status='PROCESSING', lease_until = now() + interval '1 hour' WHERE order_id='OWNED'",
+    );
     expect(await worker.runOnce()).toBe(0);
     expect(await statusCounts(res.body.data.batchId)).toEqual([{ status: 'PROCESSING', n: 1 }]);
+  });
+
+  it('the heartbeat keeps a slow dispatch owned past the lease length', async () => {
+    // lease is 300 ms in tests; the slow mock takes 400 ms. Without the heartbeat the
+    // second tick would re-claim and dispatch it a second time.
+    await submit([createOrderBody({ order_id: 'SLOW-1', metadata: { mock: 'slow' } })]).expect(202);
+    const first = worker.runOnce(); // claims + dispatches (400 ms)
+    await new Promise((r) => setTimeout(r, 350)); // lease would have lapsed by now
+    expect(await worker.runOnce()).toBe(0); // …but the heartbeat extended it
+    expect(await first).toBe(1);
+    const [row] = await AppDataSource.query(
+      "SELECT status, attempt_count, lease_until FROM orders WHERE order_id='SLOW-1'",
+    );
+    expect(row).toMatchObject({ status: 'CREATED', attempt_count: 1, lease_until: null });
+  });
+
+  it('a lapsed lease on an idempotent partner is re-dispatched automatically', async () => {
+    const res = await submit([createOrderBody({ order_id: 'DEAD-1' })]).expect(202);
+    // worker died mid-call: PROCESSING, lease in the past, no heartbeat coming
+    await AppDataSource.query(
+      "UPDATE orders SET status='PROCESSING', lease_until = now() - interval '1 second' WHERE order_id='DEAD-1'",
+    );
+    expect(await worker.runOnce()).toBe(1);
+    expect(await statusCounts(res.body.data.batchId)).toEqual([{ status: 'CREATED', n: 1 }]);
     expect((await getBatch(res.body.data.batchId)).body.data).toMatchObject({
-      status: 'QUEUED',
-      pending: 1,
+      status: 'COMPLETED',
+      succeeded: 1,
     });
   });
 
-  it('a row PROCESSING past the stuck threshold is marked FAILED, the batch completes, and it can be resubmitted', async () => {
-    const res = await submit([
-      createOrderBody({ order_id: 'STALE' }),
-      createOrderBody({ order_id: 'OK' }),
-    ]).expect(202);
-    // crash mid-dispatch, long enough ago to exceed the threshold
-    await AppDataSource.query(
-      "UPDATE orders SET status='PROCESSING', updated_at = now() - interval '1 hour' WHERE order_id='STALE'",
-    );
-    await drain();
-
-    const view = (await getBatch(res.body.data.batchId)).body.data;
-    expect(view).toMatchObject({ status: 'COMPLETED', succeeded: 1, failed: 1, pending: 0 });
-    const stale = view.orders.find((o: { orderId: string }) => o.orderId === 'STALE');
-    expect(stale).toMatchObject({ status: 'FAILED', error: { code: 'DISPATCH_INTERRUPTED' } });
-
-    // an operator has confirmed with the courier — resubmit retries it
-    await request(app)
-      .post('/api/v1/orders')
-      .send(createOrderBody({ order_id: 'STALE' }))
-      .expect(201);
+  it('a lapsed lease on a NON-idempotent partner is marked FAILED, never re-dispatched', async () => {
+    const mock = findCourier('mock') as { idempotentOnReference: boolean };
+    mock.idempotentOnReference = false;
+    try {
+      const res = await submit([createOrderBody({ order_id: 'DEAD-2' })]).expect(202);
+      await AppDataSource.query(
+        "UPDATE orders SET status='PROCESSING', lease_until = now() - interval '1 second' WHERE order_id='DEAD-2'",
+      );
+      await worker.runOnce();
+      const view = (await getBatch(res.body.data.batchId)).body.data;
+      expect(view).toMatchObject({ status: 'COMPLETED', failed: 1 });
+      expect(view.orders[0]).toMatchObject({
+        status: 'FAILED',
+        error: { code: 'DISPATCH_INTERRUPTED' },
+      });
+      // and a person, having confirmed with the courier, can resubmit it
+      await request(app)
+        .post('/api/v1/orders')
+        .send(createOrderBody({ order_id: 'DEAD-2' }))
+        .expect(201);
+    } finally {
+      mock.idempotentOnReference = true;
+    }
   });
 
   it('a partner disabled after submit fails that order with COURIER_UNAVAILABLE, not the batch', async () => {

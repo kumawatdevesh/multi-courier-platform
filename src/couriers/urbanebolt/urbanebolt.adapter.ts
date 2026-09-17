@@ -28,6 +28,8 @@ const SERVICE_TYPES: Record<string, string> = {
 class UrbaneBoltAdapter implements CourierAdapter {
   readonly key = 'urbanebolt';
   readonly displayName = 'UrbaneBolt';
+  /** Verified in UAT: a second manifest for the same orderNumber is "already shipped!". */
+  readonly idempotentOnReference = true;
 
   private readonly client: UrbaneBoltClient;
   private readonly customerCode: string;

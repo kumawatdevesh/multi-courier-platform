@@ -124,7 +124,8 @@ a missing required value fails at boot with the variable named, not at first req
 | `WORKER_POLL_MS` | `1000` | how often the worker looks for `PENDING` orders |
 | `WORKER_BATCH_SIZE` | `20` | rows claimed per tick |
 | `COURIER_CONCURRENCY` | `10` | max in-flight courier calls per partner per tick |
-| `RECONCILE_STUCK_AFTER_MS` | `300000` | a row `PROCESSING` longer than this is marked `FAILED` (`DISPATCH_INTERRUPTED`) |
+| `WORKER_LEASE_MS` | `60000` | how long a claimed order is owned; a lapsed lease means its worker died |
+| `WORKER_HEARTBEAT_MS` | `20000` | how often an in-flight dispatch extends its lease |
 | `LOG_LEVEL` | `info` | pino level; `silent` in tests |
 | `COURIER_<KEY>_ENABLED` | `false` | registers the adapter at boot |
 | `COURIER_<KEY>_BASE_URL` | — | |
@@ -140,7 +141,7 @@ UrbaneBolt needs `_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`; the mock needs noth
 ## Testing
 
 ```bash
-npm test              # everything: 72 unit + 41 integration, ~3 s, no network
+npm test              # everything: 72 unit + 43 integration, ~3 s, no network
 npm run test:unit     # retry, token cache, HTTP client (nock), UrbaneBolt mapping, DTOs, errors
 npm run test:int      # real Express + Postgres, mock courier: orders, tracking, cancel, bulk, worker
 npm run check         # typecheck (src + tests) + prettier --check + all tests
@@ -179,7 +180,9 @@ Three steps, no existing file changes:
    codes in `<key>.status-map.ts`. Build the client on `shared/http-client` so timeouts,
    retry and 401-replay come for free — do not hand-roll them. If the partner needs a
    token, build a `TokenCache` in `<key>.auth.ts` and pass it to the client; there is no
-   `authenticate` method to implement.
+   `authenticate` method to implement. Set `idempotentOnReference` honestly: `true` only if
+   the partner rejects a second shipment for the same order reference — it decides whether
+   a dispatch interrupted by a crash may be retried automatically.
 
 3. **Set env vars** — `COURIER_DELHIVERY_ENABLED=true`, `_BASE_URL`, credentials — and
    restart.

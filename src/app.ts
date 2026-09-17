@@ -23,7 +23,7 @@ export async function buildApp(): Promise<App> {
   const dataSource = await initDatabase();
   await loadCouriers();
 
-  const orderService = new OrderService(dataSource);
+  const orderService = new OrderService(dataSource, config.worker);
   const batchService = new BatchService(dataSource);
   const worker = new DispatchWorker(dataSource, orderService, batchService, config.worker);
 

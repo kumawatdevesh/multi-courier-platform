@@ -60,8 +60,8 @@ TypeORM, `synchronize: false` everywhere; schema changes go through `db/migratio
 **`orders`** — `id uuid pk`, `order_id text UNIQUE` (the caller's id, the idempotency
 anchor), `batch_id fk NULL`, `courier_partner`, `courier_order_id`, `awb`, `label_url`,
 `route_code`, `status`, `normalized_payload`, `request_payload`, `response_payload`,
-`last_error` (all jsonb), `attempt_count`, `created_at`, `updated_at`. Indexes on `awb`,
-`batch_id`, `(status, updated_at)`.
+`last_error` (all jsonb), `attempt_count`, `lease_until`, `created_at`, `updated_at`. Indexes
+on `awb`, `batch_id`, `(status, updated_at)`, `(status, lease_until)`.
 
 `INSERT … ON CONFLICT (order_id) DO NOTHING` is what makes a repeated submission safe across
 concurrent requests and inside a bulk payload — no read-then-write race, no lock. `awb` is
@@ -88,8 +88,9 @@ inserts the batch and its orders as `PENDING` in one transaction, and returns **
 A worker in the same process polls every `WORKER_POLL_MS`:
 
 ```sql
-UPDATE orders SET status = 'PROCESSING'
-WHERE id IN (SELECT id FROM orders WHERE status = 'PENDING'
+UPDATE orders SET status = 'PROCESSING', lease_until = now() + :lease
+WHERE id IN (SELECT id FROM orders
+             WHERE status = 'PENDING' OR (status = 'PROCESSING' AND lease_until < now())
              ORDER BY created_at LIMIT :n FOR UPDATE SKIP LOCKED)
 RETURNING *
 ```
@@ -100,17 +101,25 @@ through the same `OrderService.dispatch()` the single-create path uses. A batch 
 `COMPLETED` when none of its orders remain in flight; `GET /batches/:id` lists per-order
 `status`, `awb` and `error.code`.
 
-**Crash recovery — the lock is not the job state.** `FOR UPDATE SKIP LOCKED` holds a row
-lock only for the claim transaction; the courier call runs *after* commit, with `PROCESSING`
-as our own durable marker. That is a deliberate at-most-once choice: had the call run inside
-the lock, a worker crash would release the lock and another worker would re-claim and
-possibly ship the same order twice. Outside the lock, a crash instead leaves the row
-`PROCESSING`. Two things handle that: the worker sweeps rows `PROCESSING` longer than
-`RECONCILE_STUCK_AFTER_MS` (default 5 min) to `FAILED` with `DISPATCH_INTERRUPTED`, so the
-batch completes and the order is visible with a reason rather than lost; and resubmitting a
-`FAILED` `order_id` retries it (atomically — `UPDATE … WHERE status = 'FAILED'`, so concurrent
-resubmits produce one dispatch). Nothing re-dispatches an interrupted row automatically: the
-courier may hold an AWB we never received, and only a check with the courier can say.
+**Ownership is a lease, not a lock.** The row lock lives only for the claim statement —
+milliseconds — because a Postgres lock dies with its connection and so cannot represent
+work in progress across a crash. What does is `lease_until`: the claim sets it
+`WORKER_LEASE_MS` ahead, and `dispatch()` heartbeats it every `WORKER_HEARTBEAT_MS` for as
+long as the courier call runs, so a slow call is never mistaken for a dead worker. The
+single-create path takes the same lease, so an inline dispatch is invisible to the worker
+and equally recoverable. A lease that lapses means the worker stopped heartbeating — it died
+mid-call.
+
+**Crash recovery.** The courier call ran outside any lock (at-most-once), so a lapsed lease
+raises one question nobody local can answer: did the call reach the courier? The adapter
+decides what is safe. A partner that rejects a repeated reference
+(`idempotentOnReference: true` — UrbaneBolt does, verified in UAT) is re-dispatched
+automatically: the outcome is `CREATED` if the call never landed, or `FAILED /
+DUPLICATE_ORDER` if it did — the shipment exists, and its AWB needs a manual lookup. A
+partner without that guarantee is marked `FAILED / DISPATCH_INTERRUPTED` instead, because a
+retry could genuinely ship twice. Either way the batch completes and the order is visible
+with a reason. Resubmitting any `FAILED` `order_id` retries it, atomically
+(`UPDATE … WHERE status = 'FAILED'`), so concurrent resubmits produce one dispatch.
 
 **Trade-offs.** 202 over synchronous: 100 orders at ~2 s, 10 in parallel, is ~20 s — past
 gateway timeouts, and a courier outage would pin the request. Postgres `SKIP LOCKED` over

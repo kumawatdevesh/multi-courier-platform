@@ -16,6 +16,8 @@ export default defineConfig({
       COURIER_URBANEBOLT_ENABLED: 'false',
       COURIER_MOCK_ENABLED: 'true',
       COURIER_MOCK_BASE_URL: 'http://mock.courier.local',
+      WORKER_LEASE_MS: '300',
+      WORKER_HEARTBEAT_MS: '50',
     },
   },
 });

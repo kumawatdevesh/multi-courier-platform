@@ -12,6 +12,7 @@ import {
 const adapter = (key: string): CourierAdapter => ({
   key,
   displayName: key.toUpperCase(),
+  idempotentOnReference: true,
   createShipment: async () => ({ awb: 'x' }),
   trackShipment: async () => ({
     awb: 'x',
