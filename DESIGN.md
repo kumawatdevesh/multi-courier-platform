@@ -22,15 +22,12 @@ Services speak only the normalized model (`couriers/shipment.types.ts`) and the
 `trackShipment` / `cancelShipment`; auth is adapter-private via `TokenCache`). **Registry**
 is a runtime map populated by a boot-time directory scan of `couriers/<key>/<key>.adapter.ts`.
 
-A barrel file (`export * from './delhivery'`) would still be an edit to an existing file,
-which §3.2 forbids. With the scan, **adding Delhivery = a new directory + `COURIER_DELHIVERY_*`
-env vars.** Zero diffs elsewhere; `GET /couriers` and the unknown-courier 400 read the same
-map, so both stay correct for free.
-
-Cross-cutting concerns live once in `couriers/shared/`: `http-client` (timeouts, request-id
-propagation, raw request/response capture), `retry` (exponential backoff + full jitter,
-configurable), `token-cache` (single-flight, early expiry; on 401 the client invalidates,
-re-authenticates and replays exactly once). An adapter author writes mapping only.
+A barrel file would still be an edit to an existing file, which §3.2 forbids. With the
+scan, **adding Delhivery = a new directory + `COURIER_DELHIVERY_*` env vars**; `GET /couriers`
+and the unknown-courier 400 read the same map. Cross-cutting concerns live once in
+`couriers/shared/`: `http-client` (timeouts, request-id propagation, audit capture), `retry`
+(backoff + full jitter), `token-cache` (single-flight; on 401 the client re-authenticates and
+replays exactly once). An adapter author writes mapping only.
 
 ## 3. Normalized model & the UrbaneBolt mapping
 
@@ -63,11 +60,11 @@ anchor), `batch_id fk NULL`, `courier_partner`, `courier_order_id`, `awb`, `labe
 `last_error` (all jsonb), `attempt_count`, `lease_until`, `created_at`, `updated_at`. Indexes
 on `awb`, `batch_id`, `(status, updated_at)`, `(status, lease_until)`.
 
-`INSERT … ON CONFLICT (order_id) DO NOTHING` is what makes a repeated submission safe across
-concurrent requests and inside a bulk payload — no read-then-write race, no lock. `awb` is
-text (other partners issue alphanumeric waybills); `status` and `courier_partner` are varchar,
-not enums, so a new value never needs `ALTER TYPE`. `request_payload`/`response_payload` hold
-the **create** call; track and cancel are audited in `tracking_history` and `last_error`.
+`INSERT … ON CONFLICT (order_id) DO NOTHING` makes a repeated submission safe across
+concurrent requests and inside a bulk payload — no read-then-write race. `awb` is text
+(other partners issue alphanumeric waybills); `status` and `courier_partner` are varchar, not
+enums, so a new value never needs `ALTER TYPE`. `request_payload`/`response_payload` hold the
+**create** call; track and cancel are audited in `tracking_history` and `last_error`.
 
 **`tracking_history`** — append-only: `order_id fk`, `status` (nullable), `courier_status_code`,
 `courier_status_text`, `location`, `status_timestamp`, `raw_payload`, `created_at`. Two
@@ -115,15 +112,13 @@ and equally recoverable. A lease that lapses means the worker stopped heartbeati
 mid-call.
 
 **Crash recovery.** The courier call ran outside any lock (at-most-once), so a lapsed lease
-raises one question nobody local can answer: did the call reach the courier? The adapter
+leaves one question nobody local can answer: did the call reach the courier? The adapter
 decides what is safe. A partner that rejects a repeated reference
-(`idempotentOnReference: true` — UrbaneBolt does, verified in UAT) is re-dispatched
-automatically: the outcome is `CREATED` if the call never landed, or `FAILED /
-DUPLICATE_ORDER` if it did — the shipment exists, and its AWB needs a manual lookup. A
-partner without that guarantee is marked `FAILED / DISPATCH_INTERRUPTED` instead, because a
-retry could genuinely ship twice. Either way the batch completes and the order is visible
-with a reason. Resubmitting any `FAILED` `order_id` retries it, atomically
-(`UPDATE … WHERE status = 'FAILED'`), so concurrent resubmits produce one dispatch.
+(`idempotentOnReference: true` — UrbaneBolt, verified in UAT) is re-dispatched: `CREATED` if
+the call never landed, `FAILED / DUPLICATE_ORDER` if it did (the AWB then needs a manual
+lookup). A partner without that guarantee is marked `FAILED / DISPATCH_INTERRUPTED`, since a
+retry could ship twice. Either way the batch completes with a reason. Resubmitting a `FAILED`
+`order_id` retries it atomically (`UPDATE … WHERE status = 'FAILED'`).
 
 **Trade-offs.** 202 over synchronous: 100 orders at ~2 s, 10 in parallel, is ~20 s — past
 gateway timeouts, and a courier outage would pin the request. Postgres `SKIP LOCKED` over

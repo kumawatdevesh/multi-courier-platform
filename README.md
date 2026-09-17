@@ -80,6 +80,10 @@ src/
 
 Every request body carries `courier_partner`. The rest is our schema.
 
+`order_id` is the idempotency key. Resubmitting one that already has a shipment returns
+`409 DUPLICATE_ORDER` with `error.existing = { id, status, awb }` — no second courier call.
+Resubmitting one whose last attempt `FAILED` retries it with the new payload.
+
 ## Setup
 
 Requires Node 20+ and Docker (or any Postgres 14+; set `DATABASE_URL` to it and skip step 2).
@@ -141,7 +145,7 @@ UrbaneBolt needs `_USERNAME`, `_PASSWORD`, `_CUSTOMER_CODE`; the mock needs noth
 ## Testing
 
 ```bash
-npm test              # everything: 72 unit + 54 integration, ~4 s, no network
+npm test              # everything: 72 unit + 55 integration, ~4 s, no network
 npm run test:unit     # retry, token cache, HTTP client (nock), UrbaneBolt mapping, DTOs, errors
 npm run test:int      # real Express + Postgres, mock courier: orders, tracking, cancel, bulk, worker
 npm run check         # typecheck (src + tests) + prettier --check + all tests
@@ -150,8 +154,11 @@ npm run check         # typecheck (src + tests) + prettier --check + all tests
 Integration tests need a database: `TEST_DATABASE_URL=postgres://…/multi_courier_test`
 (defaults to `postgres:postgres@localhost:5432/multi_courier_test` — create it with
 `createdb multi_courier_test` or `docker compose exec db createdb -U postgres multi_courier_test`).
-They run the migrations and truncate between tests. The `mock` adapter is steered by `metadata.mock` (`reject` · `timeout` · `duplicate` ·
-`auth-fail`) and advances one lifecycle step per tracking poll.
+They run the migrations and truncate between tests. The `mock` adapter is steered by
+`metadata.mock` (`reject` · `timeout` · `unavailable` · `auth-fail` · `duplicate` · `slow` ·
+`unknown-status` · `two-hubs`) and advances one lifecycle step per tracking poll. UrbaneBolt
+is enabled in the test env with dummy credentials; the tests that use it answer for UAT
+with nock.
 
 ## API examples
 
